@@ -583,6 +583,8 @@ pub struct EmbeddingsConfig {
     pub openai_api_key: Option<SecretString>,
     /// Model to use for embeddings.
     pub model: String,
+    /// Optional explicit embedding dimension override.
+    pub dimension: Option<usize>,
     /// Ollama base URL (for Ollama provider). Defaults to http://localhost:11434.
     pub ollama_base_url: String,
 }
@@ -594,6 +596,7 @@ impl Default for EmbeddingsConfig {
             provider: "openai".to_string(),
             openai_api_key: None,
             model: "text-embedding-3-small".to_string(),
+            dimension: None,
             ollama_base_url: "http://localhost:11434".to_string(),
         }
     }
@@ -609,9 +612,37 @@ impl EmbeddingsConfig {
         let model =
             optional_env("EMBEDDING_MODEL")?.unwrap_or_else(|| settings.embeddings.model.clone());
 
+        let dimension = optional_env("EMBEDDING_DIMENSION")?
+            .map(|s| {
+                s.parse::<usize>()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "EMBEDDING_DIMENSION".to_string(),
+                        message: format!("must be a positive integer: {e}"),
+                    })
+                    .and_then(|v| {
+                        if v == 0 {
+                            Err(ConfigError::InvalidValue {
+                                key: "EMBEDDING_DIMENSION".to_string(),
+                                message: "must be a positive integer".to_string(),
+                            })
+                        } else {
+                            Ok(v)
+                        }
+                    })
+            })
+            .transpose()?
+            .or(settings.embeddings.dimension);
+
         let ollama_base_url = optional_env("OLLAMA_BASE_URL")?
             .or_else(|| settings.ollama_base_url.clone())
             .unwrap_or_else(|| "http://localhost:11434".to_string());
+
+        if dimension == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                key: "EMBEDDING_DIMENSION".to_string(),
+                message: "must be a positive integer".to_string(),
+            });
+        }
 
         let enabled = optional_env("EMBEDDING_ENABLED")?
             .map(|s| s.parse())
@@ -629,6 +660,7 @@ impl EmbeddingsConfig {
             provider,
             openai_api_key,
             model,
+            dimension,
             ollama_base_url,
         })
     }

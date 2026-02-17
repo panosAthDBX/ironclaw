@@ -126,6 +126,10 @@ pub struct EmbeddingsSettings {
     /// Model to use for embeddings.
     #[serde(default = "default_embeddings_model")]
     pub model: String,
+
+    /// Optional explicit embedding dimension override.
+    #[serde(default)]
+    pub dimension: Option<usize>,
 }
 
 fn default_embeddings_provider() -> String {
@@ -142,6 +146,7 @@ impl Default for EmbeddingsSettings {
             enabled: false,
             provider: default_embeddings_provider(),
             model: default_embeddings_model(),
+            dimension: None,
         }
     }
 }
@@ -852,6 +857,7 @@ mod tests {
         assert!(!settings.embeddings.enabled);
         assert_eq!(settings.embeddings.provider, "nearai");
         assert_eq!(settings.embeddings.model, "text-embedding-3-small");
+        assert_eq!(settings.embeddings.dimension, None);
     }
 
     #[test]

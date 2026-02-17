@@ -41,7 +41,10 @@ impl OpenAiCompatibleChatProvider {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "openai_compatible_chat".to_string(),
+                reason: format!("Failed to build HTTP client: {}", e),
+            })?;
 
         let active_model = std::sync::RwLock::new(config.model.clone());
 
@@ -511,7 +514,7 @@ impl From<ChatMessage> for ChatCompletionMessage {
                 .into_iter()
                 .map(|tc| ChatCompletionToolCall {
                     id: tc.id,
-                    call_type: "function".to_string(),
+                    call_type: Some("function".to_string()),
                     function: ChatCompletionToolCallFunction {
                         name: tc.name,
                         arguments: tc.arguments.to_string(),
@@ -555,7 +558,8 @@ struct ChatCompletionFunction {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     #[allow(dead_code)]
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ChatCompletionChoice>,
     #[serde(default)]
     usage: Option<ChatCompletionUsage>,
@@ -579,8 +583,9 @@ struct ChatCompletionResponseMessage {
 struct ChatCompletionToolCall {
     id: String,
     #[serde(rename = "type")]
+    #[serde(default)]
     #[allow(dead_code)]
-    call_type: String,
+    call_type: Option<String>,
     function: ChatCompletionToolCallFunction,
 }
 

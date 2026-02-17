@@ -23,7 +23,7 @@ use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
-use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult};
+use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolCall};
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
@@ -1291,7 +1291,7 @@ impl Agent {
                     }
 
                     // Execute each tool (with approval checking and hook interception)
-                    for mut tc in tool_calls {
+                    for (idx, mut tc) in tool_calls.clone().into_iter().enumerate() {
                         // Check if tool requires approval
                         if let Some(pending) = self
                             .maybe_pending_for_tool_call(
@@ -1302,35 +1302,7 @@ impl Agent {
                             )
                             .await
                         {
-                            // Check if auto-approved for this session
-                            let mut is_auto_approved = {
-                                let sess = session.lock().await;
-                                sess.is_tool_auto_approved(&tc.name)
-                            };
-
-                            // Let the tool inspect the specific parameters and
-                            // override auto-approval (e.g. destructive shell commands).
-                            if is_auto_approved && tool.requires_approval_for(&tc.arguments) {
-                                tracing::info!(
-                                    tool = %tc.name,
-                                    "Tool requires explicit approval for these parameters despite auto-approve"
-                                );
-                                is_auto_approved = false;
-                            }
-
-                            if !is_auto_approved {
-                                // Need approval - store pending request and return
-                                let pending = PendingApproval {
-                                    request_id: Uuid::new_v4(),
-                                    tool_name: tc.name.clone(),
-                                    parameters: tc.arguments.clone(),
-                                    description: tool.description().to_string(),
-                                    tool_call_id: tc.id.clone(),
-                                    context_messages: context_messages.clone(),
-                                };
-
-                                return Ok(AgenticLoopResult::NeedApproval { pending });
-                            }
+                            return Ok(AgenticLoopResult::NeedApproval { pending });
                         }
 
                         // Hook: BeforeToolCall — allow hooks to modify or reject tool calls
@@ -1483,8 +1455,6 @@ impl Agent {
                             &tc.name,
                             result_content,
                         ));
-
-                        idx += 1;
                     }
                 }
             }
@@ -2970,6 +2940,7 @@ mod tests {
     use crate::config::{AgentConfig, SafetyConfig};
     use crate::context::ContextManager;
     use crate::error::Error;
+    use crate::hooks::HookRegistry;
     use crate::llm::{
         CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCall,
         ToolCompletionRequest, ToolCompletionResponse,
@@ -3026,6 +2997,7 @@ mod tests {
         let deps = AgentDeps {
             store: None,
             llm: Arc::new(StaticLlmProvider),
+            cheap_llm: None,
             safety: Arc::new(SafetyLayer::new(&SafetyConfig {
                 max_output_length: 100_000,
                 injection_check_enabled: true,
@@ -3033,6 +3005,7 @@ mod tests {
             tools: Arc::new(ToolRegistry::new()),
             workspace: None,
             extension_manager: None,
+            hooks: Arc::new(HookRegistry::new()),
         };
 
         Agent::new(

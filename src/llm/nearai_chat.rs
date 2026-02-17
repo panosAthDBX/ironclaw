@@ -615,6 +615,7 @@ mod tests {
     fn test_api_url_with_base_without_v1() {
         let mut cfg = NearAiConfig {
             model: "test-model".to_string(),
+            cheap_model: None,
             base_url: "http://127.0.0.1:8318".to_string(),
             auth_base_url: "https://private.near.ai".to_string(),
             session_path: std::path::PathBuf::from("/tmp/session.json"),
@@ -622,6 +623,8 @@ mod tests {
             api_key: Some(secrecy::SecretString::from("test-key".to_string())),
             fallback_model: None,
             max_retries: 0,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
         };
 
         let provider = NearAiChatProvider::new(cfg.clone()).expect("provider");
@@ -642,6 +645,7 @@ mod tests {
     fn test_api_url_with_base_already_v1() {
         let cfg = NearAiConfig {
             model: "test-model".to_string(),
+            cheap_model: None,
             base_url: "http://127.0.0.1:8318/v1".to_string(),
             auth_base_url: "https://private.near.ai".to_string(),
             session_path: std::path::PathBuf::from("/tmp/session.json"),
@@ -649,6 +653,8 @@ mod tests {
             api_key: Some(secrecy::SecretString::from("test-key".to_string())),
             fallback_model: None,
             max_retries: 0,
+            failover_cooldown_secs: 300,
+            failover_cooldown_threshold: 3,
         };
 
         let provider = NearAiChatProvider::new(cfg).expect("provider");
