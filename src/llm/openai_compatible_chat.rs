@@ -41,7 +41,10 @@ impl OpenAiCompatibleChatProvider {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .map_err(|e| LlmError::RequestFailed {
+                provider: "openai_compatible_chat".to_string(),
+                reason: format!("Failed to build HTTP client: {e}"),
+            })?;
 
         let active_model = std::sync::RwLock::new(config.model.clone());
 
@@ -88,7 +91,12 @@ impl OpenAiCompatibleChatProvider {
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Ok(json) = serde_json::to_string(body)
             {
-                tracing::debug!("OpenAI-compatible request body: {}", json);
+                let truncated = if json.len() > 2000 {
+                    format!("{}... [truncated, {} bytes total]", &json[..2000], json.len())
+                } else {
+                    json
+                };
+                tracing::debug!("OpenAI-compatible request body: {}", truncated);
             }
 
             let response = self
@@ -123,10 +131,42 @@ impl OpenAiCompatibleChatProvider {
             };
 
             let status = response.status();
+            let content_length = response.content_length().unwrap_or(0);
+            const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+            if content_length > MAX_RESPONSE_BYTES {
+                return Err(LlmError::RequestFailed {
+                    provider: "openai_compatible_chat".to_string(),
+                    reason: format!(
+                        "Response too large: {} bytes (max {})",
+                        content_length, MAX_RESPONSE_BYTES
+                    ),
+                });
+            }
             let response_text = response.text().await.unwrap_or_default();
+            if response_text.len() as u64 > MAX_RESPONSE_BYTES {
+                return Err(LlmError::RequestFailed {
+                    provider: "openai_compatible_chat".to_string(),
+                    reason: format!(
+                        "Response too large: {} bytes (max {})",
+                        response_text.len(),
+                        MAX_RESPONSE_BYTES
+                    ),
+                });
+            }
 
             tracing::debug!("OpenAI-compatible response status: {}", status);
-            tracing::debug!("OpenAI-compatible response body: {}", response_text);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let truncated = if response_text.len() > 2000 {
+                    format!(
+                        "{}... [truncated, {} bytes total]",
+                        &response_text[..2000],
+                        response_text.len()
+                    )
+                } else {
+                    response_text.clone()
+                };
+                tracing::debug!("OpenAI-compatible response body: {}", truncated);
+            }
 
             if !status.is_success() {
                 let status_code = status.as_u16();
@@ -703,5 +743,69 @@ mod tests {
             total_tokens: None,
         };
         assert_eq!(parse_usage(Some(&usage)), (17, 0));
+    }
+
+    #[test]
+    fn test_parse_finish_reason_all_branches() {
+        assert!(matches!(
+            parse_finish_reason(Some("stop"), false),
+            FinishReason::Stop
+        ));
+        assert!(matches!(
+            parse_finish_reason(Some("length"), false),
+            FinishReason::Length
+        ));
+        assert!(matches!(
+            parse_finish_reason(Some("tool_calls"), false),
+            FinishReason::ToolUse
+        ));
+        assert!(matches!(
+            parse_finish_reason(Some("content_filter"), false),
+            FinishReason::ContentFilter
+        ));
+        // Unknown reason but tool calls present -> ToolUse
+        assert!(matches!(
+            parse_finish_reason(None, true),
+            FinishReason::ToolUse
+        ));
+        assert!(matches!(
+            parse_finish_reason(Some("weird"), true),
+            FinishReason::ToolUse
+        ));
+        // Unknown reason, no tool calls -> Unknown
+        assert!(matches!(
+            parse_finish_reason(None, false),
+            FinishReason::Unknown
+        ));
+        assert!(matches!(
+            parse_finish_reason(Some("unexpected_value"), false),
+            FinishReason::Unknown
+        ));
+    }
+
+    #[test]
+    fn test_saturate_u32_boundaries() {
+        assert_eq!(saturate_u32(0), 0);
+        assert_eq!(saturate_u32(42), 42);
+        assert_eq!(saturate_u32(u32::MAX as u64), u32::MAX);
+        assert_eq!(saturate_u32(u32::MAX as u64 + 1), u32::MAX);
+        assert_eq!(saturate_u32(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn test_normalize_tool_name_edge_cases() {
+        let known = HashSet::from(["echo".to_string(), "list_jobs".to_string()]);
+        // Empty string
+        assert_eq!(normalize_tool_name("", &known), "");
+        // Underscore in known name
+        assert_eq!(normalize_tool_name("proxy_list_jobs", &known), "list_jobs");
+        // Double prefix — proxy_proxy_x not in known, kept as-is
+        assert_eq!(
+            normalize_tool_name("proxy_proxy_echo", &known),
+            "proxy_proxy_echo"
+        );
+        // Empty known set
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(normalize_tool_name("echo", &empty), "echo");
     }
 }

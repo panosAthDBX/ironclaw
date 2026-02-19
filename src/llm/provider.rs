@@ -436,4 +436,22 @@ mod sanitize_tests {
         assert_eq!(messages[3].role, Role::User);
         assert_eq!(messages[4].role, Role::User);
     }
+
+    #[test]
+    fn test_sanitize_empty_slice() {
+        let mut messages: Vec<ChatMessage> = vec![];
+        sanitize_tool_messages(&mut messages);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_tool_result_with_no_call_id() {
+        let mut msg = ChatMessage::tool_result("", "search", "result");
+        msg.tool_call_id = None;
+        let mut messages = vec![ChatMessage::user("hello"), msg];
+        sanitize_tool_messages(&mut messages);
+        // None tool_call_id is treated as orphaned
+        assert_eq!(messages[1].role, Role::User);
+        assert!(messages[1].content.contains("[Tool `search` returned:"));
+    }
 }

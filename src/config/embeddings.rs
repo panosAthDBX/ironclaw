@@ -110,6 +110,7 @@ mod tests {
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Clear all embedding-related env vars.
+    /// Clear all embedding-related env vars.
     fn clear_embedding_env() {
         // SAFETY: Only called under ENV_MUTEX in tests. No other threads
         // observe these vars while the lock is held.
@@ -117,7 +118,86 @@ mod tests {
             std::env::remove_var("EMBEDDING_ENABLED");
             std::env::remove_var("EMBEDDING_PROVIDER");
             std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("EMBEDDING_DIMENSION");
             std::env::remove_var("OPENAI_API_KEY");
+        }
+    }
+
+    #[test]
+    fn infer_dimension_known_models() {
+        assert_eq!(infer_dimension("text-embedding-3-small"), 1536);
+        assert_eq!(infer_dimension("text-embedding-3-large"), 3072);
+        assert_eq!(infer_dimension("text-embedding-ada-002"), 1536);
+        assert_eq!(infer_dimension("nomic-embed-text"), 768);
+        assert_eq!(infer_dimension("mxbai-embed-large"), 1024);
+        assert_eq!(infer_dimension("all-minilm"), 384);
+        assert_eq!(infer_dimension("all-minilm:l6-v2"), 384);
+        assert_eq!(infer_dimension("snowflake-arctic-embed"), 1024);
+    }
+
+    #[test]
+    fn infer_dimension_unknown_model_returns_default() {
+        assert_eq!(infer_dimension("some-custom-model"), 768);
+        assert_eq!(infer_dimension(""), 768);
+    }
+
+    #[test]
+    fn effective_dimension_uses_explicit_override() {
+        let config = EmbeddingsConfig {
+            dimension: Some(512),
+            model: "nomic-embed-text".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_dimension(), 512);
+    }
+
+    #[test]
+    fn effective_dimension_infers_from_model_when_none() {
+        let config = EmbeddingsConfig {
+            dimension: None,
+            model: "text-embedding-3-large".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_dimension(), 3072);
+    }
+
+    #[test]
+    fn embedding_dimension_env_parsed() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_embedding_env();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("EMBEDDING_DIMENSION", "1024");
+        }
+
+        let settings = Settings::default();
+        let config = EmbeddingsConfig::resolve(&settings).expect("resolve should succeed");
+        assert_eq!(config.dimension, Some(1024));
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("EMBEDDING_DIMENSION");
+        }
+    }
+
+    #[test]
+    fn embedding_dimension_invalid_value() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_embedding_env();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("EMBEDDING_DIMENSION", "not-a-number");
+        }
+
+        let settings = Settings::default();
+        let result = EmbeddingsConfig::resolve(&settings);
+        assert!(result.is_err(), "invalid EMBEDDING_DIMENSION should fail");
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("EMBEDDING_DIMENSION");
         }
     }
 
