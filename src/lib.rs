@@ -63,7 +63,6 @@ pub mod secrets;
 pub mod service;
 pub mod settings;
 pub mod setup;
-pub mod sidecar;
 pub mod skills;
 pub mod tools;
 pub mod tracing_fmt;

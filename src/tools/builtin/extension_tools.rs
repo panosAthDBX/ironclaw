@@ -575,7 +575,6 @@ mod tests {
             None,
             "test".to_string(),
             None,
-            None,
         ))
     }
 }

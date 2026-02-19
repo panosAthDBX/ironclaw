@@ -84,7 +84,6 @@ mod loader;
 mod rate_limiter;
 mod runtime;
 mod storage;
-mod workspace_bridge;
 mod wrapper;
 
 // Core types
@@ -95,14 +94,12 @@ pub use limits::{
     WasmResourceLimiter,
 };
 pub use runtime::{PreparedModule, WasmRuntimeConfig, WasmToolRuntime};
-pub use workspace_bridge::WasmWorkspaceBridge;
 pub use wrapper::{OAuthRefreshConfig, WasmToolWrapper};
 
 // Capabilities (V2)
 pub use capabilities::{
     Capabilities, EndpointPattern, HttpCapability, RateLimitConfig, SecretsCapability,
-    ToolInvokeCapability, WebSocketCapability, WebSocketEndpoint, WorkspaceCapability,
-    WorkspaceReader, WorkspaceWriter,
+    ToolInvokeCapability, WorkspaceCapability, WorkspaceReader,
 };
 
 // Security components (V2)
@@ -129,5 +126,5 @@ pub use loader::{
 // Capabilities schema (for parsing *.capabilities.json files)
 pub use capabilities_schema::{
     AuthCapabilitySchema, CapabilitiesFile, OAuthConfigSchema, RateLimitSchema,
-    ValidationEndpointSchema, WebSocketCapabilitySchema, WebSocketEndpointSchema,
+    ValidationEndpointSchema,
 };
