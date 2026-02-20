@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 use wasmtime::{Config, Engine, OptLevel};
-use wasmtime::component::Component;
 
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::limits::{FuelConfig, ResourceLimits};
@@ -64,9 +63,9 @@ impl WasmRuntimeConfig {
 
 /// A compiled WASM component ready for instantiation.
 ///
-/// Contains the pre-compiled `Component` plus cached metadata extracted
-/// from the component during preparation. The compiled `Component` is
-/// reused across executions, avoiding recompilation from raw bytes.
+/// Contains the pre-compiled component plus cached metadata extracted
+/// from the component during preparation.
+#[derive(Debug)]
 pub struct PreparedModule {
     /// Tool name.
     pub name: String,
@@ -74,33 +73,16 @@ pub struct PreparedModule {
     pub description: String,
     /// Parameter schema JSON (cached from component).
     pub schema: serde_json::Value,
-    /// Pre-compiled Wasmtime component (reused across executions).
-    compiled_component: Component,
-    /// Raw component bytes (kept for serialization/caching to disk).
+    /// Compiled component bytes (can be serialized for caching).
     component_bytes: Vec<u8>,
     /// Resource limits for this tool.
     pub limits: ResourceLimits,
 }
 
-impl std::fmt::Debug for PreparedModule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedModule")
-            .field("name", &self.name)
-            .field("description", &self.description)
-            .field("limits", &self.limits)
-            .finish()
-    }
-}
-
 impl PreparedModule {
-    /// Get the compiled component bytes (for serialization/disk caching).
+    /// Get the compiled component bytes.
     pub fn component_bytes(&self) -> &[u8] {
         &self.component_bytes
-    }
-
-    /// Get the pre-compiled Wasmtime component (avoids recompilation on each execution).
-    pub fn compiled_component(&self) -> &Component {
-        &self.compiled_component
     }
 }
 
@@ -217,7 +199,6 @@ impl WasmToolRuntime {
                 name: name.clone(),
                 description,
                 schema,
-                compiled_component: component,
                 component_bytes: wasm_bytes,
                 limits: limits.unwrap_or(default_limits),
             })

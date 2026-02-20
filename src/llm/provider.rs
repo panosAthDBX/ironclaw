@@ -105,6 +105,8 @@ impl ChatMessage {
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub messages: Vec<ChatMessage>,
+    /// Optional per-request model override.
+    pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub stop_sequences: Option<Vec<String>>,
@@ -117,11 +119,18 @@ impl CompletionRequest {
     pub fn new(messages: Vec<ChatMessage>) -> Self {
         Self {
             messages,
+            model: None,
             max_tokens: None,
             temperature: None,
             stop_sequences: None,
             metadata: std::collections::HashMap::new(),
         }
+    }
+
+    /// Set model override.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Set max tokens.
@@ -188,6 +197,8 @@ pub struct ToolResult {
 pub struct ToolCompletionRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDefinition>,
+    /// Optional per-request model override.
+    pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     /// How to handle tool use: "auto", "required", or "none".
@@ -202,11 +213,18 @@ impl ToolCompletionRequest {
         Self {
             messages,
             tools,
+            model: None,
             max_tokens: None,
             temperature: None,
             tool_choice: None,
             metadata: std::collections::HashMap::new(),
         }
+    }
+
+    /// Set model override.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Set max tokens.
@@ -283,6 +301,16 @@ pub trait LlmProvider: Send + Sync {
         })
     }
 
+    /// Resolve which model should be reported for a given request.
+    ///
+    /// Providers that ignore per-request model overrides should override this
+    /// and return `active_model_name()`.
+    fn effective_model_name(&self, requested_model: Option<&str>) -> String {
+        requested_model
+            .map(std::borrow::ToOwned::to_owned)
+            .unwrap_or_else(|| self.active_model_name())
+    }
+
     /// Get the currently active model name.
     ///
     /// May differ from `model_name()` if the model was switched at runtime
@@ -336,6 +364,7 @@ pub trait LlmProvider: Send + Sync {
 pub fn sanitize_tool_messages(messages: &mut [ChatMessage]) {
     use std::collections::HashSet;
 
+    // Collect all tool_call_ids from assistant messages with tool_calls.
     let mut known_ids: HashSet<String> = HashSet::new();
     for msg in messages.iter() {
         if msg.role == Role::Assistant
@@ -347,6 +376,7 @@ pub fn sanitize_tool_messages(messages: &mut [ChatMessage]) {
         }
     }
 
+    // Rewrite orphaned tool_result messages as user messages.
     for msg in messages.iter_mut() {
         if msg.role != Role::Tool {
             continue;
@@ -371,7 +401,7 @@ pub fn sanitize_tool_messages(messages: &mut [ChatMessage]) {
 }
 
 #[cfg(test)]
-mod sanitize_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -428,12 +458,13 @@ mod sanitize_tests {
             ChatMessage::user("test"),
             ChatMessage::assistant_with_tool_calls(None, vec![tc]),
             ChatMessage::tool_result("call_1", "echo", "ok"),
+            // These are orphaned (call_2 and call_3 have no matching assistant message)
             ChatMessage::tool_result("call_2", "search", "orphan 1"),
             ChatMessage::tool_result("call_3", "http", "orphan 2"),
         ];
         sanitize_tool_messages(&mut messages);
-        assert_eq!(messages[2].role, Role::Tool);
-        assert_eq!(messages[3].role, Role::User);
-        assert_eq!(messages[4].role, Role::User);
+        assert_eq!(messages[2].role, Role::Tool); // call_1 is valid
+        assert_eq!(messages[3].role, Role::User); // call_2 orphaned
+        assert_eq!(messages[4].role, Role::User); // call_3 orphaned
     }
 }

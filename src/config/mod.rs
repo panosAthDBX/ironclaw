@@ -12,12 +12,12 @@ mod database;
 mod embeddings;
 mod heartbeat;
 pub(crate) mod helpers;
+mod hygiene;
 mod llm;
 mod routines;
 mod safety;
 mod sandbox;
 mod secrets;
-mod sidecar;
 mod skills;
 mod tunnel;
 mod wasm;
@@ -35,6 +35,7 @@ pub use self::channels::{ChannelsConfig, CliConfig, GatewayConfig, HttpConfig};
 pub use self::database::{DatabaseBackend, DatabaseConfig, default_libsql_path};
 pub use self::embeddings::EmbeddingsConfig;
 pub use self::heartbeat::HeartbeatConfig;
+pub use self::hygiene::HygieneConfig;
 pub use self::llm::{
     AnthropicDirectConfig, LlmBackend, LlmConfig, NearAiApiMode, NearAiConfig, OllamaConfig,
     OpenAiCompatibleConfig, OpenAiDirectConfig, TinfoilConfig,
@@ -43,7 +44,6 @@ pub use self::routines::RoutineConfig;
 pub use self::safety::SafetyConfig;
 pub use self::sandbox::{ClaudeCodeConfig, SandboxModeConfig};
 pub use self::secrets::SecretsConfig;
-pub use self::sidecar::SidecarConfig;
 pub use self::skills::SkillsConfig;
 pub use self::tunnel::TunnelConfig;
 pub use self::wasm::WasmConfig;
@@ -69,10 +69,10 @@ pub struct Config {
     pub secrets: SecretsConfig,
     pub builder: BuilderModeConfig,
     pub heartbeat: HeartbeatConfig,
+    pub hygiene: HygieneConfig,
     pub routines: RoutineConfig,
     pub sandbox: SandboxModeConfig,
     pub claude_code: ClaudeCodeConfig,
-    pub sidecar: SidecarConfig,
     pub skills: SkillsConfig,
     pub observability: crate::observability::ObservabilityConfig,
 }
@@ -193,10 +193,10 @@ impl Config {
             secrets: SecretsConfig::resolve().await?,
             builder: BuilderModeConfig::resolve()?,
             heartbeat: HeartbeatConfig::resolve(settings)?,
+            hygiene: HygieneConfig::resolve()?,
             routines: RoutineConfig::resolve()?,
             sandbox: SandboxModeConfig::resolve()?,
             claude_code: ClaudeCodeConfig::resolve()?,
-            sidecar: SidecarConfig::resolve()?,
             skills: SkillsConfig::resolve()?,
             observability: crate::observability::ObservabilityConfig {
                 backend: std::env::var("OBSERVABILITY_BACKEND").unwrap_or_else(|_| "none".into()),
@@ -219,6 +219,7 @@ pub async fn inject_llm_keys_from_secrets(
         ("llm_openai_api_key", "OPENAI_API_KEY"),
         ("llm_anthropic_api_key", "ANTHROPIC_API_KEY"),
         ("llm_compatible_api_key", "LLM_API_KEY"),
+        ("llm_nearai_api_key", "NEARAI_API_KEY"),
     ];
 
     let mut injected = HashMap::new();
