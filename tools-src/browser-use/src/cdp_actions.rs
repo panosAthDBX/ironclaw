@@ -632,6 +632,14 @@ fn build_snapshot_js(mode: &str, depth: u64, selector: Option<&str>) -> String {
     )
 }
 
+fn should_retry_snapshot_with_interactive_fallback(
+    mode: &str,
+    selector: Option<&str>,
+    err: &DispatchFailure,
+) -> bool {
+    mode == "full" && selector.is_none() && err.error.code == ERR_NETWORK_FAILURE
+}
+
 fn cdp_snapshot(
     client: &mut CdpClient,
     conn: &wit_host::WsConnection,
@@ -647,9 +655,37 @@ fn cdp_snapshot(
 
     let js = build_snapshot_js(mode, depth, selector);
 
-    let snapshot = eval_js_value(client, conn, session_id, &js)?;
-    enforce_snapshot_size(&snapshot)?;
-    ok_success(snapshot)
+    match eval_js_value(client, conn, session_id, &js) {
+        Ok(snapshot) => {
+            enforce_snapshot_size(&snapshot)?;
+            ok_success(snapshot)
+        }
+        Err(primary_err) if should_retry_snapshot_with_interactive_fallback(mode, selector, &primary_err) => {
+            let fallback_depth = depth.min(8);
+            let fallback_js = build_snapshot_js("interactive-only", fallback_depth, selector);
+            let mut fallback_snapshot = eval_js_value(client, conn, session_id, &fallback_js)?;
+
+            if let Some(obj) = fallback_snapshot.as_object_mut() {
+                obj.insert(
+                    "fallback".to_string(),
+                    json!({
+                        "from_mode": "full",
+                        "to_mode": "interactive-only",
+                        "from_depth": depth,
+                        "to_depth": fallback_depth,
+                    }),
+                );
+            }
+
+            enforce_snapshot_size(&fallback_snapshot)?;
+            let mut success = ok_success(fallback_snapshot)?;
+            success.warnings.push(format!(
+                "Full snapshot failed with network/trap-like error; used fallback mode=interactive-only depth={fallback_depth}."
+            ));
+            Ok(success)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // === Interactions ===
@@ -1811,6 +1847,38 @@ mod tests {
         });
         let result = crate::validation::validate_action_params("snapshot", &params);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_should_retry_snapshot_with_interactive_fallback_only_for_full_unscoped_network_failure() {
+        let err = DispatchFailure {
+            error: StructuredError::new(ERR_NETWORK_FAILURE, "trap"),
+            attempts: 1,
+        };
+
+        assert!(should_retry_snapshot_with_interactive_fallback(
+            "full", None, &err
+        ));
+        assert!(!should_retry_snapshot_with_interactive_fallback(
+            "interactive-only",
+            None,
+            &err
+        ));
+        assert!(!should_retry_snapshot_with_interactive_fallback(
+            "full",
+            Some("main"),
+            &err
+        ));
+
+        let invalid_params = DispatchFailure {
+            error: StructuredError::new(ERR_INVALID_PARAMS, "bad request"),
+            attempts: 1,
+        };
+        assert!(!should_retry_snapshot_with_interactive_fallback(
+            "full",
+            None,
+            &invalid_params
+        ));
     }
 
     #[test]

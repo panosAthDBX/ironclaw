@@ -222,6 +222,64 @@ fn normalize_value_params(action: &str, params_obj: &mut Map<String, Value>) -> 
     None
 }
 
+fn normalize_wait_params(action: &str, params_obj: &mut Map<String, Value>) -> Option<String> {
+    if action != "wait" || !params_obj.contains_key("load_state") {
+        return None;
+    }
+
+    let explicit_modes: Vec<&str> = ["ms", "ref", "selector", "text", "url_pattern", "js_condition"]
+        .iter()
+        .copied()
+        .filter(|key| params_obj.contains_key(*key))
+        .collect();
+
+    if explicit_modes.is_empty() {
+        return None;
+    }
+
+    params_obj.remove("load_state");
+
+    Some(format!(
+        "Normalized action=wait by dropping 'load_state' because explicit wait mode(s) are set: {}.",
+        explicit_modes.join(", ")
+    ))
+}
+
+fn normalize_eval_params(action: &str, params_obj: &mut Map<String, Value>) -> Option<String> {
+    if action != "eval" {
+        return None;
+    }
+
+    let has_script = params_obj
+        .get("script")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if has_script {
+        return None;
+    }
+
+    let normalized = ["value", "text", "content"].iter().find_map(|key| {
+        params_obj
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| ((*key).to_string(), s.to_string()))
+    });
+
+    if let Some((source_field, script)) = normalized {
+        params_obj.insert("script".to_string(), Value::String(script));
+        return Some(format!(
+            "Normalized action=eval payload from '{}' to 'script'.",
+            source_field
+        ));
+    }
+
+    None
+}
+
 fn strip_null_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -350,6 +408,14 @@ fn execute_inner(raw_params: &str) -> String {
     }
 
     if let Some(note) = normalize_value_params(action, &mut params_obj) {
+        normalization_notes.push(note);
+    }
+
+    if let Some(note) = normalize_wait_params(action, &mut params_obj) {
+        normalization_notes.push(note);
+    }
+
+    if let Some(note) = normalize_eval_params(action, &mut params_obj) {
         normalization_notes.push(note);
     }
 
@@ -655,6 +721,99 @@ mod tests {
         assert_eq!(
             params.get("value"),
             Some(&Value::String("authoritative".to_string()))
+        );
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn test_wait_normalization_drops_load_state_when_ms_present() {
+        let mut params = serde_json::Map::from_iter([
+            ("action".to_string(), Value::String("wait".to_string())),
+            ("ms".to_string(), Value::from(2_000u64)),
+            ("load_state".to_string(), Value::String("load".to_string())),
+        ]);
+
+        let note = normalize_wait_params("wait", &mut params);
+
+        assert!(params.get("load_state").is_none());
+        assert_eq!(params.get("ms"), Some(&Value::from(2_000u64)));
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn test_wait_normalization_keeps_load_state_when_only_mode() {
+        let mut params = serde_json::Map::from_iter([
+            ("action".to_string(), Value::String("wait".to_string())),
+            (
+                "load_state".to_string(),
+                Value::String("networkidle".to_string()),
+            ),
+        ]);
+
+        let note = normalize_wait_params("wait", &mut params);
+
+        assert_eq!(
+            params.get("load_state"),
+            Some(&Value::String("networkidle".to_string()))
+        );
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn test_wait_normalization_then_validation_accepts_ms_mode() {
+        let mut params = serde_json::Map::from_iter([
+            ("action".to_string(), Value::String("wait".to_string())),
+            ("session_id".to_string(), Value::String("s1".to_string())),
+            ("ms".to_string(), Value::from(2_000u64)),
+            ("load_state".to_string(), Value::String("load".to_string())),
+        ]);
+
+        let note = normalize_wait_params("wait", &mut params);
+        assert!(note.is_some());
+
+        let normalized = Value::Object(params);
+        let result = validate_action_params("wait", &normalized);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_eval_normalization_uses_value_as_script() {
+        let mut params = serde_json::Map::from_iter([
+            ("action".to_string(), Value::String("eval".to_string())),
+            (
+                "value".to_string(),
+                Value::String("return document.title".to_string()),
+            ),
+        ]);
+
+        let note = normalize_eval_params("eval", &mut params);
+
+        assert_eq!(
+            params.get("script"),
+            Some(&Value::String("return document.title".to_string()))
+        );
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn test_eval_normalization_preserves_existing_script() {
+        let mut params = serde_json::Map::from_iter([
+            ("action".to_string(), Value::String("eval".to_string())),
+            (
+                "script".to_string(),
+                Value::String("return 1".to_string()),
+            ),
+            (
+                "value".to_string(),
+                Value::String("return 2".to_string()),
+            ),
+        ]);
+
+        let note = normalize_eval_params("eval", &mut params);
+
+        assert_eq!(
+            params.get("script"),
+            Some(&Value::String("return 1".to_string()))
         );
         assert!(note.is_none());
     }

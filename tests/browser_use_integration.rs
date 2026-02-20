@@ -470,6 +470,39 @@ async fn test_browser_use_wait_accepts_ref_target_validation() {
 }
 
 #[tokio::test]
+async fn test_browser_use_wait_normalizes_ms_plus_load_state() {
+    let wrapper = make_wrapper(make_capabilities()).await;
+    let ctx = make_job_context();
+
+    let params = serde_json::json!({
+        "action": "wait",
+        "session_id": "s1",
+        "ms": 2000,
+        "load_state": "networkidle",
+        "backend_url": "http://127.0.0.1:19222"
+    });
+
+    let result = wrapper.execute(params, &ctx).await;
+    assert!(result.is_ok());
+
+    let output = result.unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(&output.result.to_string()).unwrap_or(output.result);
+
+    assert_eq!(value["action"], "wait");
+    let notes = value["meta"]["normalization_notes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|n| n.contains("dropping 'load_state'"))
+    );
+}
+
+#[tokio::test]
 async fn test_browser_use_drag_accepts_ref_targets_validation() {
     let wrapper = make_wrapper(make_capabilities()).await;
     let ctx = make_job_context();
@@ -513,6 +546,39 @@ async fn test_browser_use_snapshot_rejects_ref_and_selector_together() {
 
     assert_eq!(value["ok"], serde_json::Value::Bool(false));
     assert_eq!(value["error"]["code"], "invalid_params");
+}
+
+#[tokio::test]
+async fn test_browser_use_eval_normalizes_value_to_script() {
+    let wrapper = make_wrapper(make_capabilities()).await;
+    let ctx = make_job_context();
+
+    let params = serde_json::json!({
+        "action": "eval",
+        "session_id": "s1",
+        "value": "return document.title",
+        "backend_url": "http://127.0.0.1:19222"
+    });
+
+    let result = wrapper.execute(params, &ctx).await;
+    assert!(result.is_ok());
+
+    let output = result.unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(&output.result.to_string()).unwrap_or(output.result);
+
+    assert_eq!(value["action"], "eval");
+    assert_ne!(value["error"]["message"], "Missing required field 'script'");
+    let notes = value["meta"]["normalization_notes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|n| n.contains("action=eval") && n.contains("'script'"))
+    );
 }
 
 #[tokio::test]
