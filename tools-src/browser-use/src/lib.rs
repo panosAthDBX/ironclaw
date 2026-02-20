@@ -39,6 +39,7 @@ impl exports::near::agent::tool::Guest for BrowserUseTool {
         json!({
             "type": "object",
             "required": ["action"],
+            "description": "Action-specific requirements are enforced at runtime (for example fill/type/select require value plus selector or ref).",
             "properties": {
                 "action": {
                     "type": "string",
@@ -134,44 +135,6 @@ impl exports::near::agent::tool::Guest for BrowserUseTool {
                     "description": "Optional Browserless sidecar endpoint override. Must target localhost."
                 }
             },
-            "allOf": [
-                {
-                    "if": {
-                        "properties": { "action": { "const": "fill" } }
-                    },
-                    "then": {
-                        "required": ["value"],
-                        "anyOf": [
-                            { "required": ["selector"] },
-                            { "required": ["ref"] }
-                        ]
-                    }
-                },
-                {
-                    "if": {
-                        "properties": { "action": { "const": "type" } }
-                    },
-                    "then": {
-                        "required": ["value"],
-                        "anyOf": [
-                            { "required": ["selector"] },
-                            { "required": ["ref"] }
-                        ]
-                    }
-                },
-                {
-                    "if": {
-                        "properties": { "action": { "const": "select" } }
-                    },
-                    "then": {
-                        "required": ["value"],
-                        "anyOf": [
-                            { "required": ["selector"] },
-                            { "required": ["ref"] }
-                        ]
-                    }
-                }
-            ],
             "additionalProperties": true
         })
         .to_string()
