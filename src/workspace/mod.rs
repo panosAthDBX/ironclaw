@@ -244,6 +244,10 @@ impl WorkspaceStorage {
     }
 }
 
+fn can_fallback_to_fts(config: &SearchConfig) -> bool {
+    config.use_fts
+}
+
 /// Default template seeded into HEARTBEAT.md on first access.
 ///
 /// Intentionally comment-only so the heartbeat runner treats it as
@@ -579,18 +583,29 @@ impl Workspace {
     pub async fn search_with_config(
         &self,
         query: &str,
-        config: SearchConfig,
+        mut config: SearchConfig,
     ) -> Result<Vec<SearchResult>, WorkspaceError> {
-        // Generate embedding for semantic search if provider available
+        // Generate embedding for semantic search if provider available.
+        // If embedding generation fails but FTS is enabled, fall back to FTS-only
+        // instead of failing the entire memory_search tool call.
         let embedding = if let Some(ref provider) = self.embeddings {
-            Some(
-                provider
-                    .embed(query)
-                    .await
-                    .map_err(|e| WorkspaceError::EmbeddingFailed {
-                        reason: e.to_string(),
-                    })?,
-            )
+            match provider.embed(query).await {
+                Ok(vector) => Some(vector),
+                Err(err) => {
+                    if can_fallback_to_fts(&config) {
+                        tracing::warn!(
+                            error = %err,
+                            "Embedding generation failed during search; falling back to FTS-only"
+                        );
+                        config.use_vector = false;
+                        None
+                    } else {
+                        return Err(WorkspaceError::EmbeddingFailed {
+                            reason: err.to_string(),
+                        });
+                    }
+                }
+            }
         } else {
             None
         };
@@ -810,5 +825,11 @@ mod tests {
         assert_eq!(normalize_directory("foo/bar"), "foo/bar");
         assert_eq!(normalize_directory("/"), "");
         assert_eq!(normalize_directory(""), "");
+    }
+
+    #[test]
+    fn test_can_fallback_to_fts_when_enabled() {
+        assert!(can_fallback_to_fts(&SearchConfig::default()));
+        assert!(!can_fallback_to_fts(&SearchConfig::default().vector_only()));
     }
 }

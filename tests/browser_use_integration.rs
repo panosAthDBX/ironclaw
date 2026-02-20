@@ -148,6 +148,22 @@ async fn test_browser_use_tool_registration_and_metadata() {
     assert!(schema["properties"]["action"]["enum"].is_array());
     assert_eq!(schema["properties"]["selector"]["type"], "string");
     assert_eq!(schema["properties"]["session_id"]["type"], "string");
+    assert_eq!(schema["properties"]["value"]["type"], "string");
+
+    let all_of = schema["allOf"]
+        .as_array()
+        .expect("schema should include conditional requirements");
+    let has_fill_value_requirement = all_of.iter().any(|rule| {
+        rule["if"]["properties"]["action"]["const"] == "fill"
+            && rule["then"]["required"]
+                .as_array()
+                .map(|required| required.iter().any(|field| field == "value"))
+                .unwrap_or(false)
+    });
+    assert!(
+        has_fill_value_requirement,
+        "schema should require value for fill action"
+    );
 }
 
 #[tokio::test]

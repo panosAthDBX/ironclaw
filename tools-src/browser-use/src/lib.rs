@@ -53,13 +53,75 @@ impl exports::near::agent::tool::Guest for BrowserUseTool {
                     "type": "string",
                     "description": "Browser session identifier. Required for stateful actions except session_create/session_list."
                 },
-                "ref": {
-                    "type": "string",
-                    "description": "Deterministic snapshot ref, format @eN (e.g. @e12)."
-                },
                 "selector": {
                     "type": "string",
-                    "description": "Semantic selector for DOM actions (click/fill/etc). Not used as navigation URL for open."
+                    "description": "CSS selector target for DOM actions. Use either selector or ref for element-targeted actions."
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Snapshot ref target (@eN). Use either ref or selector for element-targeted actions."
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Input value for fill/type/select actions."
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Keyboard key for press/keydown/keyup actions (for example Enter, Escape, Tab)."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Attribute or cookie name for get_attr/cookies_get/cookies_delete."
+                },
+                "source_selector": {
+                    "type": "string",
+                    "description": "Source element selector for drag action."
+                },
+                "source_ref": {
+                    "type": "string",
+                    "description": "Source snapshot ref (@eN) for drag action."
+                },
+                "target_selector": {
+                    "type": "string",
+                    "description": "Target element selector for drag action."
+                },
+                "target_ref": {
+                    "type": "string",
+                    "description": "Target snapshot ref (@eN) for drag action."
+                },
+                "ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120000,
+                    "description": "Wait duration in milliseconds for action=wait."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Wait until page text contains this value (action=wait)."
+                },
+                "url_pattern": {
+                    "type": "string",
+                    "description": "Wait until current URL contains this substring (action=wait)."
+                },
+                "load_state": {
+                    "type": "string",
+                    "enum": ["load", "domcontentloaded", "networkidle"],
+                    "description": "Page readiness state to wait for (action=wait)."
+                },
+                "js_condition": {
+                    "type": "string",
+                    "description": "JavaScript condition expression to poll until truthy (action=wait)."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["full", "interactive-only", "compact"],
+                    "description": "Snapshot mode for action=snapshot."
+                },
+                "depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 64,
+                    "description": "Traversal depth for action=snapshot."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -72,6 +134,44 @@ impl exports::near::agent::tool::Guest for BrowserUseTool {
                     "description": "Optional Browserless sidecar endpoint override. Must target localhost."
                 }
             },
+            "allOf": [
+                {
+                    "if": {
+                        "properties": { "action": { "const": "fill" } }
+                    },
+                    "then": {
+                        "required": ["value"],
+                        "anyOf": [
+                            { "required": ["selector"] },
+                            { "required": ["ref"] }
+                        ]
+                    }
+                },
+                {
+                    "if": {
+                        "properties": { "action": { "const": "type" } }
+                    },
+                    "then": {
+                        "required": ["value"],
+                        "anyOf": [
+                            { "required": ["selector"] },
+                            { "required": ["ref"] }
+                        ]
+                    }
+                },
+                {
+                    "if": {
+                        "properties": { "action": { "const": "select" } }
+                    },
+                    "then": {
+                        "required": ["value"],
+                        "anyOf": [
+                            { "required": ["selector"] },
+                            { "required": ["ref"] }
+                        ]
+                    }
+                }
+            ],
             "additionalProperties": true
         })
         .to_string()
