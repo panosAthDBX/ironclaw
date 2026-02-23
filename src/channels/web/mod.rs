@@ -285,6 +285,22 @@ impl Channel for GatewayChannel {
                 message: msg,
                 thread_id: thread_id.clone(),
             },
+            StatusUpdate::Reasoning(update) => SseEvent::ReasoningUpdate {
+                thread_id: update.thread_id,
+                session_id: update.session_id,
+                turn_number: update.turn_number,
+                narrative: update.narrative,
+                tool_decisions: update
+                    .tool_decisions
+                    .into_iter()
+                    .map(|d| crate::channels::web::types::ToolDecisionSsePayload {
+                        tool_name: d.tool_name,
+                        rationale: d.rationale,
+                        outcome: d.outcome,
+                        parallel_group: d.parallel_group,
+                    })
+                    .collect(),
+            },
             StatusUpdate::JobStarted {
                 job_id,
                 title,

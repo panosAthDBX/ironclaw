@@ -99,6 +99,26 @@ impl OutgoingResponse {
     }
 }
 
+/// One tool decision in a reasoning update.
+#[derive(Debug, Clone)]
+pub struct ReasoningToolDecision {
+    pub tool_name: String,
+    pub rationale: Option<String>,
+    pub parameters: serde_json::Value,
+    pub outcome: String,
+    pub parallel_group: Option<usize>,
+}
+
+/// Reasoning summary attached to a turn.
+#[derive(Debug, Clone)]
+pub struct ReasoningStatusUpdate {
+    pub session_id: String,
+    pub thread_id: String,
+    pub turn_number: usize,
+    pub narrative: Option<String>,
+    pub tool_decisions: Vec<ReasoningToolDecision>,
+}
+
 /// Status update types for showing agent activity.
 #[derive(Debug, Clone)]
 pub enum StatusUpdate {
@@ -114,6 +134,8 @@ pub enum StatusUpdate {
     StreamChunk(String),
     /// General status message.
     Status(String),
+    /// Structured reasoning summary for the current turn.
+    Reasoning(ReasoningStatusUpdate),
     /// A sandbox job has started (shown as a clickable card in the UI).
     JobStarted {
         job_id: String,

@@ -134,12 +134,6 @@ async fn main() -> anyhow::Result<()> {
                             )
                             .with_model(&config.embeddings.model, config.embeddings.dimension),
                         )),
-                        "ollama" => Some(Arc::new(
-                            ironclaw::workspace::OllamaEmbeddings::new(
-                                &config.embeddings.ollama_base_url,
-                            )
-                            .with_model(&config.embeddings.model, 768),
-                        )),
                         _ => {
                             if let Some(api_key) = config.embeddings.openai_api_key() {
                                 Some(Arc::new(ironclaw::workspace::OpenAiEmbeddings::with_model(
@@ -762,17 +756,6 @@ async fn main() -> anyhow::Result<()> {
                 Some(Arc::new(
                     OllamaEmbeddings::new(&config.embeddings.ollama_base_url)
                         .with_model(&config.embeddings.model, config.embeddings.dimension),
-                ))
-            }
-            "ollama" => {
-                tracing::info!(
-                    "Embeddings enabled via Ollama (model: {}, url: {})",
-                    config.embeddings.model,
-                    config.embeddings.ollama_base_url,
-                );
-                Some(Arc::new(
-                    OllamaEmbeddings::new(&config.embeddings.ollama_base_url)
-                        .with_model(&config.embeddings.model, 768),
                 ))
             }
             _ => {

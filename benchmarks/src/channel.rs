@@ -143,6 +143,13 @@ impl Channel for BenchChannel {
             StatusUpdate::Status(ref msg) => {
                 cap.status_log.push(format!("status: {msg}"));
             }
+            StatusUpdate::Reasoning(update) => {
+                cap.status_log.push(format!(
+                    "reasoning_update: turn={} tools={}",
+                    update.turn_number,
+                    update.tool_decisions.len()
+                ));
+            }
             StatusUpdate::JobStarted {
                 ref job_id,
                 ref title,

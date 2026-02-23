@@ -285,7 +285,15 @@ Work independently to complete this job. Report when done."#,
                         tool_calls,
                         content,
                     } => {
-                        if let Some(ref text) = content {
+                        let safe_narrative = content.as_ref().and_then(|text| {
+                            let sanitized = self.safety.sanitize_reasoning_text(text);
+                            if sanitized.is_none() {
+                                tracing::warn!("Dropping worker reasoning after safety processing");
+                            }
+                            sanitized
+                        });
+
+                        if let Some(ref text) = safe_narrative {
                             self.post_event(
                                 "message",
                                 serde_json::json!({
@@ -300,26 +308,32 @@ Work independently to complete this job. Report when done."#,
                         reason_ctx
                             .messages
                             .push(ChatMessage::assistant_with_tool_calls(
-                                content,
+                                safe_narrative.clone(),
                                 tool_calls.clone(),
                             ));
 
+                        let mut reasoning_decisions: Vec<serde_json::Value> = Vec::new();
+                        let is_parallel_batch = tool_calls.len() > 1;
+
                         for tc in tool_calls {
+                            let tool_name = tc.name.clone();
+                            let tool_args = tc.arguments.clone();
+                            let tool_call_id = tc.id.clone();
                             self.post_event(
                                 "tool_use",
                                 serde_json::json!({
-                                    "tool_name": tc.name,
-                                    "input": truncate(&tc.arguments.to_string(), 500),
+                                    "tool_name": tool_name,
+                                    "input": truncate(&tool_args.to_string(), 500),
                                 }),
                             )
                             .await;
 
-                            let result = self.execute_tool(&tc.name, &tc.arguments).await;
+                            let result = self.execute_tool(&tool_name, &tool_args).await;
 
                             self.post_event(
                                 "tool_result",
                                 serde_json::json!({
-                                    "tool_name": tc.name,
+                                    "tool_name": tool_name,
                                     "output": match &result {
                                         Ok(output) => truncate(output, 2000),
                                         Err(e) => format!("Error: {}", truncate(e, 500)),
@@ -329,17 +343,36 @@ Work independently to complete this job. Report when done."#,
                             )
                             .await;
 
+                            let outcome = if result.is_ok() { "success" } else { "error" };
+                            reasoning_decisions.push(serde_json::json!({
+                                "tool_name": tool_name,
+                                "rationale": safe_narrative.clone(),
+                                "outcome": outcome,
+                                "parallel_group": if is_parallel_batch { Some(0usize) } else { None },
+                            }));
+
                             if let Ok(ref output) = result {
                                 last_output = output.clone();
                             }
                             let selection = ToolSelection {
-                                tool_name: tc.name.clone(),
-                                parameters: tc.arguments.clone(),
+                                tool_name,
+                                parameters: tool_args,
                                 reasoning: String::new(),
                                 alternatives: vec![],
-                                tool_call_id: tc.id.clone(),
+                                tool_call_id,
                             };
                             self.process_result(reason_ctx, &selection, result);
+                        }
+
+                        if safe_narrative.is_some() || !reasoning_decisions.is_empty() {
+                            self.post_event(
+                                "reasoning",
+                                serde_json::json!({
+                                    "narrative": safe_narrative,
+                                    "tool_decisions": reasoning_decisions,
+                                }),
+                            )
+                            .await;
                         }
                     }
                 }

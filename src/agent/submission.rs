@@ -40,6 +40,24 @@ impl SubmissionParser {
         if lower == "/suggest" {
             return Submission::Suggest;
         }
+        if lower == "/reasoning" {
+            return Submission::Reasoning {
+                query: ReasoningQuery::Latest,
+            };
+        }
+        if let Some(rest) = lower.strip_prefix("/reasoning ") {
+            let arg = rest.trim();
+            if arg == "all" {
+                return Submission::Reasoning {
+                    query: ReasoningQuery::All,
+                };
+            }
+            if let Ok(turn_number) = arg.parse::<usize>() {
+                return Submission::Reasoning {
+                    query: ReasoningQuery::Turn(turn_number),
+                };
+            }
+        }
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
@@ -148,6 +166,13 @@ impl SubmissionParser {
 
 /// A submission to the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReasoningQuery {
+    Latest,
+    Turn(usize),
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Submission {
     /// User text input (starts a new turn).
     UserInput {
@@ -211,6 +236,9 @@ pub enum Submission {
 
     /// Suggest next steps based on the current thread.
     Suggest,
+
+    /// Show captured reasoning for turns in the current thread.
+    Reasoning { query: ReasoningQuery },
 
     /// Quit the agent. Bypasses thread-state checks.
     Quit,
@@ -296,6 +324,7 @@ impl Submission {
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
+                | Self::Reasoning { .. }
                 | Self::SystemCommand { .. }
         )
     }
@@ -470,6 +499,33 @@ mod tests {
     fn test_parser_suggest() {
         let submission = SubmissionParser::parse("/suggest");
         assert!(matches!(submission, Submission::Suggest));
+    }
+
+    #[test]
+    fn test_parser_reasoning_variants() {
+        let submission = SubmissionParser::parse("/reasoning");
+        assert!(matches!(
+            submission,
+            Submission::Reasoning {
+                query: ReasoningQuery::Latest
+            }
+        ));
+
+        let submission = SubmissionParser::parse("/reasoning all");
+        assert!(matches!(
+            submission,
+            Submission::Reasoning {
+                query: ReasoningQuery::All
+            }
+        ));
+
+        let submission = SubmissionParser::parse("/reasoning 3");
+        assert!(matches!(
+            submission,
+            Submission::Reasoning {
+                query: ReasoningQuery::Turn(3)
+            }
+        ));
     }
 
     #[test]

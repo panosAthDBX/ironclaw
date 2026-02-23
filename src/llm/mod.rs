@@ -12,6 +12,7 @@ pub mod costs;
 pub mod failover;
 mod nearai;
 mod nearai_chat;
+mod openai_compatible_chat;
 mod provider;
 mod reasoning;
 pub mod response_cache;
@@ -43,6 +44,7 @@ use secrecy::ExposeSecret;
 
 use crate::config::{LlmBackend, LlmConfig, NearAiApiMode, NearAiConfig};
 use crate::error::LlmError;
+use crate::llm::openai_compatible_chat::OpenAiCompatibleChatProvider;
 
 /// Create an LLM provider based on configuration.
 ///
@@ -224,31 +226,13 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
             provider: "openai_compatible".to_string(),
         })?;
 
-    use rig::providers::openai;
-
-    let client: openai::CompletionsClient = openai::Client::builder()
-        .base_url(&compat.base_url)
-        .api_key(
-            compat
-                .api_key
-                .as_ref()
-                .map(|k| k.expose_secret().to_string())
-                .unwrap_or_else(|| "no-key".to_string()),
-        )
-        .build()
-        .map_err(|e| LlmError::RequestFailed {
-            provider: "openai_compatible".to_string(),
-            reason: format!("Failed to create OpenAI-compatible client: {}", e),
-        })?
-        .completions_api();
-
-    let model = client.completion_model(&compat.model);
     tracing::info!(
         "Using OpenAI-compatible endpoint (chat completions, base_url: {}, model: {})",
         compat.base_url,
         compat.model
     );
-    Ok(Arc::new(RigAdapter::new(model, &compat.model)))
+
+    Ok(Arc::new(OpenAiCompatibleChatProvider::new(compat.clone())?))
 }
 
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).

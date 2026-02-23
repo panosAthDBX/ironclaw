@@ -108,14 +108,14 @@ impl Agent {
         // Create a JobContext for tool execution (chat doesn't have a real job)
         let job_ctx = JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
 
-        const MAX_TOOL_ITERATIONS: usize = 10;
+        let max_tool_iterations = self.config.max_tool_iterations.max(1);
         let mut iteration = 0;
         loop {
             iteration += 1;
-            if iteration > MAX_TOOL_ITERATIONS {
+            if iteration > max_tool_iterations {
                 return Err(crate::error::LlmError::InvalidResponse {
                     provider: "agent".to_string(),
-                    reason: format!("Exceeded maximum tool iterations ({})", MAX_TOOL_ITERATIONS),
+                    reason: format!("Exceeded maximum tool iterations ({})", max_tool_iterations),
                 }
                 .into());
             }
@@ -199,10 +199,27 @@ impl Agent {
                     tool_calls,
                     content,
                 } => {
+                    let mut safe_narrative = None;
+                    if let Some(ref text) = content {
+                        let sanitized = self.safety().sanitize_reasoning_text(text);
+                        if sanitized.is_none() {
+                            tracing::warn!("Dropping reasoning narrative after safety processing");
+                        }
+                        if let Some(ref narrative) = sanitized {
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id)
+                                && let Some(turn) = thread.last_turn_mut()
+                            {
+                                turn.set_narrative(narrative.clone());
+                            }
+                        }
+                        safe_narrative = sanitized;
+                    }
+
                     // Add the assistant message with tool_calls to context.
                     // OpenAI protocol requires this before tool-result messages.
                     context_messages.push(ChatMessage::assistant_with_tool_calls(
-                        content,
+                        safe_narrative.clone(),
                         tool_calls.clone(),
                     ));
 
@@ -219,14 +236,23 @@ impl Agent {
                         )
                         .await;
 
-                    // Record tool calls in the thread
+                    // Record tool calls in the thread and keep index mapping.
+                    let mut recorded_indices: Vec<Option<usize>> = vec![None; tool_calls.len()];
                     {
                         let mut sess = session.lock().await;
                         if let Some(thread) = sess.threads.get_mut(&thread_id)
                             && let Some(turn) = thread.last_turn_mut()
                         {
-                            for tc in &tool_calls {
-                                turn.record_tool_call(&tc.name, tc.arguments.clone());
+                            for (tc_idx, tc) in tool_calls.iter().enumerate() {
+                                let rationale = safe_narrative.clone();
+                                let parallel_group = if tool_count > 1 { Some(0) } else { None };
+                                turn.record_tool_call(
+                                    &tc.name,
+                                    tc.arguments.clone(),
+                                    rationale,
+                                    parallel_group,
+                                );
+                                recorded_indices[tc_idx] = turn.tool_calls.len().checked_sub(1);
                             }
                         }
                     }
@@ -240,12 +266,12 @@ impl Agent {
                     // Phase 3 can emit results in the correct order.
                     enum PreflightOutcome {
                         /// Hook rejected/blocked this tool; contains the error message.
-                        Rejected(String),
+                        Rejected { error: String, tool_idx: usize },
                         /// Tool passed preflight and will be executed.
-                        Runnable,
+                        Runnable { tool_idx: usize },
                     }
                     let mut preflight: Vec<(crate::llm::ToolCall, PreflightOutcome)> = Vec::new();
-                    let mut runnable: Vec<(usize, crate::llm::ToolCall)> = Vec::new();
+                    let mut runnable: Vec<(usize, usize, crate::llm::ToolCall)> = Vec::new();
                     let mut approval_needed: Option<(
                         usize,
                         crate::llm::ToolCall,
@@ -290,20 +316,20 @@ impl Agent {
                             Err(crate::hooks::HookError::Rejected { reason }) => {
                                 preflight.push((
                                     tc,
-                                    PreflightOutcome::Rejected(format!(
-                                        "Tool call rejected by hook: {}",
-                                        reason
-                                    )),
+                                    PreflightOutcome::Rejected {
+                                        error: format!("Tool call rejected by hook: {}", reason),
+                                        tool_idx: idx,
+                                    },
                                 ));
                                 continue; // skip to next tool (not infinite: using for loop)
                             }
                             Err(err) => {
                                 preflight.push((
                                     tc,
-                                    PreflightOutcome::Rejected(format!(
-                                        "Tool call blocked by hook policy: {}",
-                                        err
-                                    )),
+                                    PreflightOutcome::Rejected {
+                                        error: format!("Tool call blocked by hook policy: {}", err),
+                                        tool_idx: idx,
+                                    },
                                 ));
                                 continue;
                             }
@@ -323,8 +349,8 @@ impl Agent {
                         }
 
                         let preflight_idx = preflight.len();
-                        preflight.push((tc.clone(), PreflightOutcome::Runnable));
-                        runnable.push((preflight_idx, tc));
+                        preflight.push((tc.clone(), PreflightOutcome::Runnable { tool_idx: idx }));
+                        runnable.push((preflight_idx, idx, tc));
                     }
 
                     // === Phase 2: Parallel execution ===
@@ -335,7 +361,7 @@ impl Agent {
 
                     if runnable.len() <= 1 {
                         // Single tool (or none): execute inline
-                        for (pf_idx, tc) in &runnable {
+                        for (pf_idx, _tool_idx, tc) in &runnable {
                             let _ = self
                                 .channels
                                 .send_status(
@@ -369,8 +395,9 @@ impl Agent {
                         // Multiple tools: execute in parallel via JoinSet
                         let mut join_set = JoinSet::new();
 
-                        for (pf_idx, tc) in &runnable {
+                        for (pf_idx, tool_idx, tc) in &runnable {
                             let pf_idx = *pf_idx;
+                            let tool_idx = *tool_idx;
                             let tools = self.tools().clone();
                             let safety = self.safety().clone();
                             let channels = self.channels.clone();
@@ -410,13 +437,13 @@ impl Agent {
                                     )
                                     .await;
 
-                                (pf_idx, result)
+                                (pf_idx, tool_idx, result)
                             });
                         }
 
                         while let Some(join_result) = join_set.join_next().await {
                             match join_result {
-                                Ok((pf_idx, result)) => {
+                                Ok((pf_idx, _tool_idx, result)) => {
                                     exec_results[pf_idx] = Some(result);
                                 }
                                 Err(e) => {
@@ -433,7 +460,7 @@ impl Agent {
                         }
 
                         // Fill panicked slots with error results
-                        for (runnable_idx, (pf_idx, tc)) in runnable.iter().enumerate() {
+                        for (runnable_idx, (pf_idx, _tool_idx, tc)) in runnable.iter().enumerate() {
                             if exec_results[*pf_idx].is_none() {
                                 tracing::error!(
                                     tool = %tc.name,
@@ -458,21 +485,21 @@ impl Agent {
 
                     for (pf_idx, (tc, outcome)) in preflight.into_iter().enumerate() {
                         match outcome {
-                            PreflightOutcome::Rejected(error_msg) => {
-                                // Record hook rejection in thread
+                            PreflightOutcome::Rejected { error, tool_idx } => {
+                                if let Some(call_idx) =
+                                    recorded_indices.get(tool_idx).and_then(|idx| *idx)
                                 {
                                     let mut sess = session.lock().await;
                                     if let Some(thread) = sess.threads.get_mut(&thread_id)
                                         && let Some(turn) = thread.last_turn_mut()
                                     {
-                                        turn.record_tool_error(error_msg.clone());
+                                        turn.record_tool_error_at(call_idx, error.clone());
                                     }
                                 }
                                 context_messages
-                                    .push(ChatMessage::tool_result(&tc.id, &tc.name, error_msg));
+                                    .push(ChatMessage::tool_result(&tc.id, &tc.name, error));
                             }
-                            PreflightOutcome::Runnable => {
-                                // Retrieve the execution result for this slot
+                            PreflightOutcome::Runnable { tool_idx } => {
                                 let tool_result =
                                     exec_results[pf_idx].take().unwrap_or_else(|| {
                                         Err(crate::error::ToolError::ExecutionFailed {
@@ -482,7 +509,6 @@ impl Agent {
                                         .into())
                                     });
 
-                                // Send ToolResult preview
                                 if let Ok(ref output) = tool_result
                                     && !output.is_empty()
                                 {
@@ -499,7 +525,8 @@ impl Agent {
                                         .await;
                                 }
 
-                                // Record result in thread
+                                if let Some(call_idx) =
+                                    recorded_indices.get(tool_idx).and_then(|idx| *idx)
                                 {
                                     let mut sess = session.lock().await;
                                     if let Some(thread) = sess.threads.get_mut(&thread_id)
@@ -507,17 +534,18 @@ impl Agent {
                                     {
                                         match &tool_result {
                                             Ok(output) => {
-                                                turn.record_tool_result(serde_json::json!(output));
+                                                turn.record_tool_result_at(
+                                                    call_idx,
+                                                    serde_json::json!(output),
+                                                );
                                             }
                                             Err(e) => {
-                                                turn.record_tool_error(e.to_string());
+                                                turn.record_tool_error_at(call_idx, e.to_string());
                                             }
                                         }
                                     }
                                 }
 
-                                // Check for auth awaiting — defer the return
-                                // until all results are recorded.
                                 if deferred_auth.is_none()
                                     && let Some((ext_name, instructions)) =
                                         check_auth_required(&tc.name, &tool_result)
@@ -545,7 +573,6 @@ impl Agent {
                                     deferred_auth = Some(instructions);
                                 }
 
-                                // Sanitize and add tool result to context
                                 let result_content = match tool_result {
                                     Ok(output) => {
                                         let sanitized =
@@ -567,6 +594,9 @@ impl Agent {
                             }
                         }
                     }
+
+                    self.emit_reasoning_update(message, &session, thread_id)
+                        .await;
 
                     // Return auth response after all results are recorded
                     if let Some(instructions) = deferred_auth {
@@ -841,6 +871,7 @@ mod tests {
             AgentConfig {
                 name: "test-agent".to_string(),
                 max_parallel_jobs: 1,
+                max_tool_iterations: 10,
                 job_timeout: Duration::from_secs(60),
                 stuck_threshold: Duration::from_secs(60),
                 repair_check_interval: Duration::from_secs(30),

@@ -16,7 +16,7 @@ use crate::agent::heartbeat::spawn_heartbeat;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session_manager::SessionManager;
-use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
+use crate::agent::submission::{ReasoningQuery, Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler};
 use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusUpdate};
 use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig};
@@ -655,6 +655,18 @@ impl Agent {
             Submission::Heartbeat => self.process_heartbeat().await,
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::Reasoning { query } => {
+                let formatted = match query {
+                    ReasoningQuery::Latest => {
+                        self.format_reasoning_latest(session, thread_id).await
+                    }
+                    ReasoningQuery::Turn(turn) => {
+                        self.format_reasoning_turn(session, thread_id, turn).await
+                    }
+                    ReasoningQuery::All => self.format_reasoning_all(session, thread_id).await,
+                };
+                Ok(SubmissionResult::response(formatted))
+            }
             Submission::Quit => return Ok(None),
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await

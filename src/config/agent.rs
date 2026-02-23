@@ -9,6 +9,7 @@ use crate::settings::Settings;
 pub struct AgentConfig {
     pub name: String,
     pub max_parallel_jobs: usize,
+    pub max_tool_iterations: usize,
     pub job_timeout: Duration,
     pub stuck_threshold: Duration,
     pub repair_check_interval: Duration,
@@ -37,6 +38,14 @@ impl AgentConfig {
                     message: format!("must be a positive integer: {e}"),
                 })?
                 .unwrap_or(settings.agent.max_parallel_jobs as usize),
+            max_tool_iterations: optional_env("AGENT_MAX_TOOL_ITERATIONS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AGENT_MAX_TOOL_ITERATIONS".to_string(),
+                    message: format!("must be a positive integer: {e}"),
+                })?
+                .unwrap_or(settings.agent.max_tool_iterations as usize),
             job_timeout: Duration::from_secs(
                 optional_env("AGENT_JOB_TIMEOUT_SECS")?
                     .map(|s| s.parse())

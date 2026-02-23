@@ -14,12 +14,119 @@ use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
     AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
 };
-use crate::agent::session::{PendingApproval, Session, ThreadState};
+use crate::agent::session::{PendingApproval, Session, Thread, ThreadState, Turn};
 use crate::agent::submission::SubmissionResult;
-use crate::channels::{IncomingMessage, StatusUpdate};
+use crate::channels::{
+    IncomingMessage, ReasoningStatusUpdate, ReasoningToolDecision, StatusUpdate,
+};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::ChatMessage;
+
+fn find_unresolved_tool_call_index(
+    turn: &Turn,
+    tool_name: &str,
+    parameters: &serde_json::Value,
+) -> Option<usize> {
+    turn.tool_calls.iter().enumerate().find_map(|(idx, call)| {
+        if call.name == tool_name
+            && call.parameters == *parameters
+            && call.result.is_none()
+            && call.error.is_none()
+        {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
+fn format_tool_parameters(params: &serde_json::Value, max_chars: usize) -> String {
+    let compact = serde_json::to_string(params).unwrap_or_else(|_| params.to_string());
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        let mut out = String::new();
+        for ch in compact.chars().take(max_chars) {
+            out.push(ch);
+        }
+        out.push_str("...");
+        out
+    }
+}
+
+fn format_tool_outcome(call: &crate::agent::session::TurnToolCall) -> String {
+    if let Some(error) = &call.error {
+        if error.is_empty() {
+            "error".to_string()
+        } else {
+            format!("error: {}", error)
+        }
+    } else if let Some(result) = &call.result {
+        if let Some(s) = result.as_str() {
+            format!("success ({} chars)", s.chars().count())
+        } else if let Some(arr) = result.as_array() {
+            format!("success ({} items)", arr.len())
+        } else if let Some(obj) = result.as_object() {
+            format!("success ({} fields)", obj.len())
+        } else {
+            "success".to_string()
+        }
+    } else {
+        "pending".to_string()
+    }
+}
+
+fn has_reasoning_data(turn: &Turn) -> bool {
+    turn.narrative.is_some() || turn.tool_calls.iter().any(|c| c.rationale.is_some())
+}
+
+fn format_reasoning_for_turn(thread: &Thread, turn: &Turn) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "  ┄ Reasoning — thread {}, turn {}\n",
+        thread.id,
+        turn.turn_number + 1
+    ));
+
+    if let Some(narrative) = &turn.narrative {
+        out.push_str(&format!("  Narrative: \"{}\"\n\n", narrative));
+    }
+
+    if turn.tool_calls.is_empty() {
+        out.push_str("  ─ Turn had no tool calls.\n");
+        return out;
+    }
+
+    let mut last_parallel: Option<usize> = None;
+    for call in &turn.tool_calls {
+        if let Some(group) = call.parallel_group
+            && last_parallel != Some(group)
+        {
+            out.push_str(&format!("  ┄ [parallel batch {}]\n", group));
+            last_parallel = Some(group);
+        }
+
+        let entry_prefix = if call.parallel_group.is_some() {
+            "  ┄   ↳"
+        } else {
+            "  ┄"
+        };
+        out.push_str(&format!("{} {}\n", entry_prefix, call.name));
+
+        if let Some(rationale) = &call.rationale {
+            out.push_str(&format!("    rationale: \"{}\"\n", rationale));
+        }
+
+        out.push_str(&format!(
+            "    params:    {}\n",
+            format_tool_parameters(&call.parameters, 200)
+        ));
+        out.push_str(&format!("    outcome:   {}\n\n", format_tool_outcome(call)));
+    }
+
+    out
+}
 
 impl Agent {
     /// Hydrate a historical thread from DB into memory if not already present.
@@ -721,17 +828,25 @@ impl Agent {
                 let mut sess = session.lock().await;
                 if let Some(thread) = sess.threads.get_mut(&thread_id)
                     && let Some(turn) = thread.last_turn_mut()
+                    && let Some(call_idx) = find_unresolved_tool_call_index(
+                        turn,
+                        &pending.tool_name,
+                        &pending.parameters,
+                    )
                 {
                     match &tool_result {
                         Ok(output) => {
-                            turn.record_tool_result(serde_json::json!(output));
+                            turn.record_tool_result_at(call_idx, serde_json::json!(output));
                         }
                         Err(e) => {
-                            turn.record_tool_error(e.to_string());
+                            turn.record_tool_error_at(call_idx, e.to_string());
                         }
                     }
                 }
             }
+
+            self.emit_reasoning_update(message, &session, thread_id)
+                .await;
 
             // If tool_auth returned awaiting_token, enter auth mode and
             // return instructions directly (skip agentic loop continuation).
@@ -969,10 +1084,14 @@ impl Agent {
                     let mut sess = session.lock().await;
                     if let Some(thread) = sess.threads.get_mut(&thread_id)
                         && let Some(turn) = thread.last_turn_mut()
+                        && let Some(call_idx) =
+                            find_unresolved_tool_call_index(turn, &tc.name, &tc.arguments)
                     {
                         match &deferred_result {
-                            Ok(output) => turn.record_tool_result(serde_json::json!(output)),
-                            Err(e) => turn.record_tool_error(e.to_string()),
+                            Ok(output) => {
+                                turn.record_tool_result_at(call_idx, serde_json::json!(output))
+                            }
+                            Err(e) => turn.record_tool_error_at(call_idx, e.to_string()),
                         }
                     }
                 }
@@ -1008,6 +1127,9 @@ impl Agent {
 
                 context_messages.push(ChatMessage::tool_result(&tc.id, &tc.name, deferred_content));
             }
+
+            self.emit_reasoning_update(message, &session, thread_id)
+                .await;
 
             // Return auth response after all results are recorded
             if let Some(instructions) = deferred_auth {
@@ -1344,6 +1466,149 @@ impl Agent {
             "New thread: {}",
             thread_id
         )))
+    }
+
+    pub(super) async fn emit_reasoning_update(
+        &self,
+        message: &IncomingMessage,
+        session: &Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) {
+        let update = {
+            let sess = session.lock().await;
+            let Some(thread) = sess.threads.get(&thread_id) else {
+                return;
+            };
+            let Some(turn) = thread.last_turn() else {
+                return;
+            };
+            if turn.tool_calls.is_empty() {
+                return;
+            }
+
+            let tool_decisions = turn
+                .tool_calls
+                .iter()
+                .map(|call| ReasoningToolDecision {
+                    tool_name: call.name.clone(),
+                    rationale: call.rationale.clone(),
+                    parameters: call.parameters.clone(),
+                    outcome: format_tool_outcome(call),
+                    parallel_group: call.parallel_group,
+                })
+                .collect::<Vec<_>>();
+
+            ReasoningStatusUpdate {
+                session_id: thread.session_id.to_string(),
+                thread_id: thread.id.to_string(),
+                turn_number: turn.turn_number,
+                narrative: turn.narrative.clone(),
+                tool_decisions,
+            }
+        };
+
+        let _ = self
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::Reasoning(update),
+                &message.metadata,
+            )
+            .await;
+    }
+
+    pub(super) async fn format_reasoning_latest(
+        &self,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) -> String {
+        let sess = session.lock().await;
+        let Some(thread) = sess.threads.get(&thread_id) else {
+            return "No active thread found.".to_string();
+        };
+
+        let Some(turn) = thread.turns.last() else {
+            return "No turns in this thread yet.".to_string();
+        };
+
+        if turn.tool_calls.is_empty() {
+            return format!("  ─ Turn {} had no tool calls.", turn.turn_number + 1);
+        }
+
+        if !has_reasoning_data(turn) {
+            return format!(
+                "  ─ No reasoning recorded for turn {}.",
+                turn.turn_number + 1
+            );
+        }
+
+        format_reasoning_for_turn(thread, turn)
+    }
+
+    pub(super) async fn format_reasoning_turn(
+        &self,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        display_turn_number: usize,
+    ) -> String {
+        if display_turn_number == 0 {
+            return "  ✗ Turn numbers start at 1.".to_string();
+        }
+
+        let sess = session.lock().await;
+        let Some(thread) = sess.threads.get(&thread_id) else {
+            return "No active thread found.".to_string();
+        };
+
+        let idx = display_turn_number - 1;
+        let Some(turn) = thread.turns.get(idx) else {
+            return format!(
+                "  ✗ No reasoning data for turn {} in this thread.",
+                display_turn_number
+            );
+        };
+
+        if turn.tool_calls.is_empty() {
+            return format!("  ─ Turn {} had no tool calls.", display_turn_number);
+        }
+
+        if !has_reasoning_data(turn) {
+            return format!(
+                "  ─ No reasoning recorded for turn {}.",
+                display_turn_number
+            );
+        }
+
+        format_reasoning_for_turn(thread, turn)
+    }
+
+    pub(super) async fn format_reasoning_all(
+        &self,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) -> String {
+        let sess = session.lock().await;
+        let Some(thread) = sess.threads.get(&thread_id) else {
+            return "No active thread found.".to_string();
+        };
+
+        if thread.turns.is_empty() {
+            return "No turns in this thread yet.".to_string();
+        }
+
+        let mut sections = Vec::new();
+        for turn in &thread.turns {
+            if turn.tool_calls.is_empty() || !has_reasoning_data(turn) {
+                continue;
+            }
+            sections.push(format_reasoning_for_turn(thread, turn));
+        }
+
+        if sections.is_empty() {
+            return "  ─ No reasoning recorded in this thread.".to_string();
+        }
+
+        sections.join("\n")
     }
 
     pub(super) async fn process_switch_thread(

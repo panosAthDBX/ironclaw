@@ -701,6 +701,7 @@ async fn chat_history_handler(
                         has_error: tc.error.is_some(),
                     })
                     .collect(),
+                reasoning: build_turn_reasoning_info(thread, t),
             })
             .collect();
 
@@ -740,6 +741,45 @@ async fn chat_history_handler(
     }))
 }
 
+fn build_turn_reasoning_info(
+    thread: &crate::agent::session::Thread,
+    turn: &crate::agent::session::Turn,
+) -> Option<TurnReasoningInfo> {
+    if turn.tool_calls.is_empty() {
+        return None;
+    }
+
+    let tool_decisions = turn
+        .tool_calls
+        .iter()
+        .map(|tc| {
+            let outcome = if tc.error.is_some() {
+                "error".to_string()
+            } else if tc.result.is_some() {
+                "success".to_string()
+            } else {
+                "pending".to_string()
+            };
+
+            ToolDecisionInfo {
+                tool_name: tc.name.clone(),
+                rationale: tc.rationale.clone(),
+                parameters: tc.parameters.clone(),
+                outcome,
+                parallel_group: tc.parallel_group,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Some(TurnReasoningInfo {
+        session_id: thread.session_id,
+        thread_id: thread.id,
+        turn_number: turn.turn_number,
+        narrative: turn.narrative.clone(),
+        tool_decisions,
+    })
+}
+
 /// Build TurnInfo pairs from flat DB messages (alternating user/assistant).
 fn build_turns_from_db_messages(messages: &[crate::history::ConversationMessage]) -> Vec<TurnInfo> {
     let mut turns = Vec::new();
@@ -756,6 +796,7 @@ fn build_turns_from_db_messages(messages: &[crate::history::ConversationMessage]
                 started_at: msg.created_at.to_rfc3339(),
                 completed_at: None,
                 tool_calls: Vec::new(),
+                reasoning: None,
             };
 
             // Check if next message is an assistant response
@@ -2543,6 +2584,27 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_turn_reasoning_info_with_tool_calls() {
+        let session_id = Uuid::new_v4();
+        let mut thread = crate::agent::session::Thread::new(session_id);
+        let turn = thread.start_turn("hello");
+        turn.record_tool_call(
+            "echo",
+            serde_json::json!({"message": "hi"}),
+            Some("testing rationale".to_string()),
+            Some(0),
+        );
+        turn.record_tool_result_at(0, serde_json::json!("ok"));
+
+        let info = build_turn_reasoning_info(&thread, &thread.turns[0]);
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.tool_decisions.len(), 1);
+        assert_eq!(info.tool_decisions[0].tool_name, "echo");
+        assert_eq!(info.tool_decisions[0].parallel_group, Some(0));
+    }
 
     #[test]
     fn test_build_turns_from_db_messages_complete() {

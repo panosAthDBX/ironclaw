@@ -278,6 +278,10 @@ pub struct AgentSettings {
     #[serde(default = "default_max_parallel_jobs")]
     pub max_parallel_jobs: u32,
 
+    /// Maximum tool iterations per chat turn.
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: u32,
+
     /// Job timeout in seconds.
     #[serde(default = "default_job_timeout")]
     pub job_timeout_secs: u64,
@@ -312,6 +316,10 @@ fn default_max_parallel_jobs() -> u32 {
     5
 }
 
+fn default_max_tool_iterations() -> u32 {
+    10
+}
+
 fn default_job_timeout() -> u64 {
     3600 // 1 hour
 }
@@ -341,6 +349,7 @@ impl Default for AgentSettings {
         Self {
             name: default_agent_name(),
             max_parallel_jobs: default_max_parallel_jobs(),
+            max_tool_iterations: default_max_tool_iterations(),
             job_timeout_secs: default_job_timeout(),
             stuck_threshold_secs: default_stuck_threshold(),
             use_planning: true,
@@ -1259,9 +1268,11 @@ mod tests {
         let from_db = Settings::from_db_map(&db_map);
 
         // Step 1 of the new wizard run: user enters a NEW database_url
-        let mut step1_settings = Settings::default();
-        step1_settings.database_backend = Some("postgres".to_string());
-        step1_settings.database_url = Some("postgres://new-host/ironclaw".to_string());
+        let step1_settings = Settings {
+            database_backend: Some("postgres".to_string()),
+            database_url: Some("postgres://new-host/ironclaw".to_string()),
+            ..Default::default()
+        };
 
         // Wizard flow: load DB → merge_from(step1_overrides)
         let mut current = step1_settings.clone();

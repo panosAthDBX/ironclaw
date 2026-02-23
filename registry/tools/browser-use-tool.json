@@ -1,0 +1,31 @@
+{
+  "name": "browser-use-tool",
+  "display_name": "Browser Use",
+  "kind": "tool",
+  "version": "0.1.0",
+  "description": "Browser automation via Browserless for navigation, interaction, snapshots, and extraction",
+  "keywords": ["browser", "automation", "web", "cdp", "browserless"],
+
+  "source": {
+    "dir": "tools-src/browser-use",
+    "capabilities": "browser-use-tool.capabilities.json",
+    "crate_name": "browser-use-tool"
+  },
+
+  "artifacts": {
+    "wasm32-wasip2": {
+      "url": null,
+      "sha256": null
+    }
+  },
+
+  "auth_summary": {
+    "method": "none",
+    "provider": "Browserless",
+    "secrets": [],
+    "shared_auth": null,
+    "setup_url": "https://github.com/browserless/browserless"
+  },
+
+  "tags": ["browser", "automation"]
+}

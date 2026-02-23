@@ -401,6 +401,9 @@ pub struct Turn {
     pub response: Option<String>,
     /// Tool calls made during this turn.
     pub tool_calls: Vec<TurnToolCall>,
+    /// Turn-level narrative from model pre-tool content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrative: Option<String>,
     /// Turn state.
     pub state: TurnState,
     /// When the turn started.
@@ -419,6 +422,7 @@ impl Turn {
             user_input: user_input.into(),
             response: None,
             tool_calls: Vec::new(),
+            narrative: None,
             state: TurnState::Processing,
             started_at: Utc::now(),
             completed_at: None,
@@ -446,26 +450,39 @@ impl Turn {
         self.completed_at = Some(Utc::now());
     }
 
+    /// Set the turn-level narrative.
+    pub fn set_narrative(&mut self, narrative: String) {
+        self.narrative = Some(narrative);
+    }
+
     /// Record a tool call.
-    pub fn record_tool_call(&mut self, name: impl Into<String>, params: serde_json::Value) {
+    pub fn record_tool_call(
+        &mut self,
+        name: impl Into<String>,
+        params: serde_json::Value,
+        rationale: Option<String>,
+        parallel_group: Option<usize>,
+    ) {
         self.tool_calls.push(TurnToolCall {
             name: name.into(),
             parameters: params,
             result: None,
             error: None,
+            rationale,
+            parallel_group,
         });
     }
 
     /// Record tool call result.
-    pub fn record_tool_result(&mut self, result: serde_json::Value) {
-        if let Some(call) = self.tool_calls.last_mut() {
+    pub fn record_tool_result_at(&mut self, call_index: usize, result: serde_json::Value) {
+        if let Some(call) = self.tool_calls.get_mut(call_index) {
             call.result = Some(result);
         }
     }
 
     /// Record tool call error.
-    pub fn record_tool_error(&mut self, error: impl Into<String>) {
-        if let Some(call) = self.tool_calls.last_mut() {
+    pub fn record_tool_error_at(&mut self, call_index: usize, error: impl Into<String>) {
+        if let Some(call) = self.tool_calls.get_mut(call_index) {
             call.error = Some(error.into());
         }
     }
@@ -482,6 +499,12 @@ pub struct TurnToolCall {
     pub result: Option<serde_json::Value>,
     /// Error from the tool (if failed).
     pub error: Option<String>,
+    /// Sanitized rationale for selecting this tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// Parallel batch group index for this tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_group: Option<usize>,
 }
 
 #[cfg(test)]
@@ -526,8 +549,13 @@ mod tests {
     #[test]
     fn test_turn_tool_calls() {
         let mut turn = Turn::new(0, "Test input");
-        turn.record_tool_call("echo", serde_json::json!({"message": "test"}));
-        turn.record_tool_result(serde_json::json!("test"));
+        turn.record_tool_call(
+            "echo",
+            serde_json::json!({"message": "test"}),
+            Some("test rationale".to_string()),
+            None,
+        );
+        turn.record_tool_result_at(0, serde_json::json!("test"));
 
         assert_eq!(turn.tool_calls.len(), 1);
         assert!(turn.tool_calls[0].result.is_some());
@@ -907,12 +935,46 @@ mod tests {
     #[test]
     fn test_turn_tool_call_error() {
         let mut turn = Turn::new(0, "test");
-        turn.record_tool_call("http", serde_json::json!({"url": "example.com"}));
-        turn.record_tool_error("timeout");
+        turn.record_tool_call(
+            "http",
+            serde_json::json!({"url": "example.com"}),
+            None,
+            Some(0),
+        );
+        turn.record_tool_error_at(0, "timeout");
 
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].error, Some("timeout".to_string()));
         assert!(turn.tool_calls[0].result.is_none());
+    }
+
+    #[test]
+    fn test_turn_narrative_set_and_get() {
+        let mut turn = Turn::new(0, "test");
+        assert!(turn.narrative.is_none());
+        turn.set_narrative("I will check memory first.".to_string());
+        assert_eq!(
+            turn.narrative.as_deref(),
+            Some("I will check memory first.")
+        );
+    }
+
+    #[test]
+    fn test_record_tool_call_with_rationale_and_parallel_group() {
+        let mut turn = Turn::new(0, "test");
+        turn.record_tool_call(
+            "memory_search",
+            serde_json::json!({"query": "auth"}),
+            Some("searching prior context".to_string()),
+            Some(2),
+        );
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(
+            turn.tool_calls[0].rationale.as_deref(),
+            Some("searching prior context")
+        );
+        assert_eq!(turn.tool_calls[0].parallel_group, Some(2));
     }
 
     #[test]

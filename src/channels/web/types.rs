@@ -48,6 +48,8 @@ pub struct TurnInfo {
     pub started_at: String,
     pub completed_at: Option<String>,
     pub tool_calls: Vec<ToolCallInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<TurnReasoningInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,6 +57,37 @@ pub struct ToolCallInfo {
     pub name: String,
     pub has_result: bool,
     pub has_error: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToolDecisionInfo {
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    pub parameters: serde_json::Value,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_group: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TurnReasoningInfo {
+    pub session_id: Uuid,
+    pub thread_id: Uuid,
+    pub turn_number: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub narrative: Option<String>,
+    pub tool_decisions: Vec<ToolDecisionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDecisionSsePayload {
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_group: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +158,15 @@ pub enum SseEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_id: Option<String>,
     },
+    #[serde(rename = "reasoning_update")]
+    ReasoningUpdate {
+        thread_id: String,
+        session_id: String,
+        turn_number: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        narrative: Option<String>,
+        tool_decisions: Vec<ToolDecisionSsePayload>,
+    },
     #[serde(rename = "job_started")]
     JobStarted {
         job_id: String,
@@ -186,6 +228,13 @@ pub enum SseEvent {
     },
     #[serde(rename = "job_status")]
     JobStatus { job_id: String, message: String },
+    #[serde(rename = "job_reasoning")]
+    JobReasoning {
+        job_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        narrative: Option<String>,
+        tool_decisions: Vec<ToolDecisionSsePayload>,
+    },
     #[serde(rename = "job_result")]
     JobResult {
         job_id: String,
@@ -526,6 +575,7 @@ impl WsServerMessage {
             SseEvent::ToolResult { .. } => "tool_result",
             SseEvent::StreamChunk { .. } => "stream_chunk",
             SseEvent::Status { .. } => "status",
+            SseEvent::ReasoningUpdate { .. } => "reasoning_update",
             SseEvent::JobStarted { .. } => "job_started",
             SseEvent::ApprovalNeeded { .. } => "approval_needed",
             SseEvent::AuthRequired { .. } => "auth_required",
@@ -536,6 +586,7 @@ impl WsServerMessage {
             SseEvent::JobToolUse { .. } => "job_tool_use",
             SseEvent::JobToolResult { .. } => "job_tool_result",
             SseEvent::JobStatus { .. } => "job_status",
+            SseEvent::JobReasoning { .. } => "job_reasoning",
             SseEvent::JobResult { .. } => "job_result",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
@@ -781,6 +832,31 @@ mod tests {
     }
 
     #[test]
+    fn test_ws_server_from_sse_reasoning_update() {
+        let sse = SseEvent::ReasoningUpdate {
+            thread_id: "t1".to_string(),
+            session_id: "s1".to_string(),
+            turn_number: 2,
+            narrative: Some("checking memory first".to_string()),
+            tool_decisions: vec![ToolDecisionSsePayload {
+                tool_name: "memory_search".to_string(),
+                rationale: Some("find prior context".to_string()),
+                outcome: "success".to_string(),
+                parallel_group: None,
+            }],
+        };
+        let ws = WsServerMessage::from_sse_event(&sse);
+        match ws {
+            WsServerMessage::Event { event_type, data } => {
+                assert_eq!(event_type, "reasoning_update");
+                assert_eq!(data["turn_number"], 2);
+                assert_eq!(data["tool_decisions"][0]["tool_name"], "memory_search");
+            }
+            _ => panic!("Expected Event variant"),
+        }
+    }
+
+    #[test]
     fn test_ws_server_from_sse_approval_needed() {
         let sse = SseEvent::ApprovalNeeded {
             request_id: "r1".to_string(),
@@ -857,6 +933,28 @@ mod tests {
         assert_eq!(parsed["instructions"], "Get your token from...");
         assert!(parsed.get("auth_url").is_none());
         assert_eq!(parsed["setup_url"], "https://notion.so/integrations");
+    }
+
+    #[test]
+    fn test_turn_reasoning_info_serialization() {
+        let info = TurnReasoningInfo {
+            session_id: Uuid::new_v4(),
+            thread_id: Uuid::new_v4(),
+            turn_number: 1,
+            narrative: Some("check memory then shell".to_string()),
+            tool_decisions: vec![ToolDecisionInfo {
+                tool_name: "memory_search".to_string(),
+                rationale: Some("find context".to_string()),
+                parameters: serde_json::json!({"query":"context"}),
+                outcome: "success".to_string(),
+                parallel_group: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["turn_number"], 1);
+        assert_eq!(parsed["tool_decisions"][0]["tool_name"], "memory_search");
     }
 
     #[test]

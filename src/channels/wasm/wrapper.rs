@@ -2036,6 +2036,15 @@ fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_cha
                 metadata_json,
             }
         }
+        StatusUpdate::Reasoning(update) => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!(
+                "Reasoning update for turn {} ({} decisions)",
+                update.turn_number + 1,
+                update.tool_decisions.len()
+            ),
+            metadata_json,
+        },
         StatusUpdate::ApprovalNeeded {
             tool_name,
             description,

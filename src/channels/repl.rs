@@ -66,6 +66,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/heartbeat",
     "/summarize",
     "/suggest",
+    "/reasoning",
     "/thread",
     "/resume",
 ];
@@ -247,6 +248,7 @@ fn print_help() {
     println!("  {c}/compact{r}           {d}compact context window{r}");
     println!("  {c}/new{r}               {d}new conversation thread{r}");
     println!("  {c}/interrupt{r}         {d}stop current operation{r}");
+    println!("  {c}/reasoning{r} [N|all] {d}show reasoning for latest, turn N, or all turns{r}");
     println!();
     println!("  {h}Approval responses{r}");
     println!("  {c}yes{r} ({c}y{r})            {d}approve tool execution{r}");
@@ -467,6 +469,52 @@ impl Channel for ReplChannel {
                 if debug || msg.contains("approval") || msg.contains("Approval") {
                     let display = truncate_for_preview(&msg, CLI_STATUS_MAX);
                     eprintln!("  \x1b[90m{display}\x1b[0m");
+                }
+            }
+            StatusUpdate::Reasoning(update) => {
+                if update.narrative.is_none() && update.tool_decisions.is_empty() {
+                    return Ok(());
+                }
+
+                eprintln!();
+                eprintln!(
+                    "  \x1b[90m┄ Reasoning (turn {})\x1b[0m",
+                    update.turn_number + 1
+                );
+
+                if let Some(narrative) = &update.narrative {
+                    let display = truncate_for_preview(narrative, 300);
+                    eprintln!("  \x1b[90m┄ \"{}\"\x1b[0m", display);
+                }
+
+                let mut last_parallel: Option<usize> = None;
+                for decision in &update.tool_decisions {
+                    if let Some(group) = decision.parallel_group
+                        && last_parallel != Some(group)
+                    {
+                        eprintln!("  \x1b[90m┄ [parallel batch {}]\x1b[0m", group);
+                        last_parallel = Some(group);
+                    }
+
+                    let prefix = if decision.parallel_group.is_some() {
+                        "  \x1b[90m┄   ↳\x1b[0m"
+                    } else {
+                        "  \x1b[90m┄\x1b[0m"
+                    };
+                    eprintln!("{} \x1b[36m{}\x1b[0m", prefix, decision.tool_name);
+
+                    if let Some(rationale) = &decision.rationale {
+                        eprintln!(
+                            "    \x1b[90m{}\x1b[0m",
+                            truncate_for_preview(rationale, 240)
+                        );
+                    }
+
+                    let params = serde_json::to_string(&decision.parameters)
+                        .unwrap_or_else(|_| decision.parameters.to_string());
+                    let params = truncate_for_preview(&params, 200);
+                    eprintln!("    \x1b[90mparams: {}\x1b[0m", params);
+                    eprintln!("    \x1b[90m→ {}\x1b[0m", decision.outcome);
                 }
             }
             StatusUpdate::ApprovalNeeded {

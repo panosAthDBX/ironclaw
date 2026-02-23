@@ -387,6 +387,7 @@ impl Agent {
                 "  /heartbeat        Run heartbeat check\n",
                 "  /summarize        Summarize current thread\n",
                 "  /suggest          Suggest next steps\n",
+                "  /reasoning [N|all] Show reasoning for latest, turn N, or all turns\n",
                 "\n",
                 "  /quit             Exit",
             ))),

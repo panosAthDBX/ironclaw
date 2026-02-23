@@ -23,7 +23,7 @@ use crate::llm::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ModelMetadata,
     Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
 };
-use crate::llm::retry::{is_retryable_status, retry_backoff_delay};
+use crate::llm::retry::retry_backoff_delay;
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
@@ -137,7 +137,9 @@ impl OpenAiCompatibleChatProvider {
                     });
                 }
 
-                if is_retryable_status(status_code) && attempt < self.max_retries {
+                if matches!(status_code, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
+                    && attempt < self.max_retries
+                {
                     let delay = retry_backoff_delay(attempt);
                     tracing::warn!(
                         "OpenAI-compatible endpoint returned HTTP {} (attempt {}/{}), retrying in {:?}",
@@ -457,9 +459,9 @@ fn parse_usage(usage: Option<&ChatCompletionUsage>) -> (u32, u32) {
     if let Some(total) = usage.total_tokens {
         tracing::warn!(
             total_tokens = total,
-            "OpenAI-compatible usage missing prompt/completion tokens; treating total as output"
+            "OpenAI-compatible usage missing prompt/completion tokens; returning total as input to avoid downstream underflow"
         );
-        return (0, saturate_u32(total));
+        return (saturate_u32(total), 0);
     }
 
     if let Some(prompt) = usage.prompt_tokens {
@@ -686,13 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_usage_total_only_maps_to_output() {
+    fn test_parse_usage_total_only_maps_to_input() {
         let usage = ChatCompletionUsage {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: Some(42),
         };
-        assert_eq!(parse_usage(Some(&usage)), (0, 42));
+        assert_eq!(parse_usage(Some(&usage)), (42, 0));
     }
 
     #[test]

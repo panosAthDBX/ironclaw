@@ -129,6 +129,37 @@ impl SafetyLayer {
         self.policy.check(content)
     }
 
+    /// Sanitize free-form reasoning text before storage or display.
+    ///
+    /// Returns `None` when validation, leak detection, or policy blocking fails.
+    pub fn sanitize_reasoning_text(&self, text: &str) -> Option<String> {
+        let validation = self.validator.validate(text);
+        if !validation.is_valid {
+            return None;
+        }
+
+        let cleaned = self.sanitizer.sanitize(text).content;
+
+        let leak_cleaned = match self.leak_detector.scan_and_clean(&cleaned) {
+            Ok(content) => content,
+            Err(_) => return None,
+        };
+
+        let violations = self.policy.check(&leak_cleaned);
+        if violations.iter().any(|rule| rule.action == PolicyAction::Block) {
+            return None;
+        }
+
+        if violations
+            .iter()
+            .any(|rule| rule.action == PolicyAction::Sanitize)
+        {
+            return Some(self.sanitizer.sanitize(&leak_cleaned).content);
+        }
+
+        Some(leak_cleaned)
+    }
+
     /// Wrap content in safety delimiters for the LLM.
     ///
     /// This creates a clear structural boundary between trusted instructions
@@ -205,5 +236,31 @@ mod tests {
         // should pass through unmodified
         assert_eq!(output.content, "normal text");
         assert!(!output.was_modified);
+    }
+
+    #[test]
+    fn test_sanitize_reasoning_text_blocks_secret() {
+        let config = SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: true,
+        };
+        let safety = SafetyLayer::new(&config);
+
+        let blocked = safety.sanitize_reasoning_text("token sk-proj-test1234567890abcdefghij");
+        assert!(blocked.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_reasoning_text_redacts_bearer() {
+        let config = SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: true,
+        };
+        let safety = SafetyLayer::new(&config);
+
+        let sanitized = safety
+            .sanitize_reasoning_text("using Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456")
+            .expect("reasoning should be sanitized, not blocked");
+        assert!(sanitized.contains("[REDACTED]"));
     }
 }

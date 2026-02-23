@@ -370,6 +370,7 @@ async fn run_task_isolated(params: TaskRunParams<'_>) -> TaskResult {
     let agent_config = AgentConfig {
         name: format!("bench-{}", task.id),
         max_parallel_jobs: 1,
+        max_tool_iterations: 20,
         job_timeout: timeout,
         stuck_threshold: timeout,
         repair_check_interval: timeout + std::time::Duration::from_secs(999),

@@ -63,6 +63,35 @@ pub fn spawn_job_monitor(
                                 break;
                             }
                         }
+                        SseEvent::JobReasoning {
+                            narrative,
+                            tool_decisions,
+                            ..
+                        } => {
+                            let narrative = narrative
+                                .map(|n| format!("narrative=\"{}\"", n))
+                                .unwrap_or_else(|| "narrative=<none>".to_string());
+                            let tools = tool_decisions
+                                .iter()
+                                .map(|d| d.tool_name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let msg = IncomingMessage::new(
+                                "job_monitor",
+                                "system",
+                                format!(
+                                    "[Job {}] Reasoning: {}; tools=[{}]",
+                                    short_id, narrative, tools
+                                ),
+                            );
+                            if inject_tx.send(msg).await.is_err() {
+                                tracing::debug!(
+                                    job_id = %short_id,
+                                    "Inject channel closed, stopping monitor"
+                                );
+                                break;
+                            }
+                        }
                         SseEvent::JobResult { status, .. } => {
                             let msg = IncomingMessage::new(
                                 "job_monitor",

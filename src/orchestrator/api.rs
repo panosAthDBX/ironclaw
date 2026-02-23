@@ -15,6 +15,8 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use crate::channels::web::types::SseEvent;
+use crate::config::SafetyConfig;
+use crate::safety::SafetyLayer;
 use crate::db::Database;
 use crate::llm::{CompletionRequest, LlmProvider, ToolCompletionRequest};
 use crate::orchestrator::auth::{TokenStore, worker_auth_middleware};
@@ -250,6 +252,10 @@ async fn job_event_handler(
     Path(job_id): Path<Uuid>,
     Json(payload): Json<JobEventPayload>,
 ) -> Result<StatusCode, StatusCode> {
+    let reasoning_safety = SafetyLayer::new(&SafetyConfig {
+        max_output_length: 100_000,
+        injection_check_enabled: true,
+    });
     tracing::debug!(
         job_id = %job_id,
         event_type = %payload.event_type,
@@ -315,6 +321,69 @@ async fn job_event_handler(
                 .unwrap_or("")
                 .to_string(),
         },
+        "reasoning" => {
+            let tool_decisions = payload
+                .data
+                .get("tool_decisions")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(
+                            |entry| crate::channels::web::types::ToolDecisionSsePayload {
+                                tool_name: entry
+                                    .get("tool_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                rationale: entry
+                                    .get("rationale")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| {
+                                        let sanitized = reasoning_safety.sanitize_reasoning_text(s);
+                                        if sanitized.is_none() {
+                                            tracing::warn!(
+                                                job_id = %job_id,
+                                                "Dropped job reasoning rationale after safety processing"
+                                            );
+                                        }
+                                        sanitized
+                                    }),
+                                outcome: entry
+                                    .get("outcome")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                parallel_group: entry
+                                    .get("parallel_group")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|n| n as usize),
+                            },
+                        )
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let narrative = payload
+                .data
+                .get("narrative")
+                .and_then(|v| v.as_str())
+                .and_then(|s| {
+                    let sanitized = reasoning_safety.sanitize_reasoning_text(s);
+                    if sanitized.is_none() {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            "Dropped job reasoning narrative after safety processing"
+                        );
+                    }
+                    sanitized
+                });
+
+            SseEvent::JobReasoning {
+                job_id: job_id_str,
+                narrative,
+                tool_decisions,
+            }
+        }
         "result" => SseEvent::JobResult {
             job_id: job_id_str,
             status: payload
