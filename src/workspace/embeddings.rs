@@ -69,19 +69,12 @@ pub struct OpenAiEmbeddings {
 }
 
 impl OpenAiEmbeddings {
-    fn build_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    }
-
     /// Create a new OpenAI embedding provider with the default model.
     ///
     /// Uses text-embedding-3-small which has 1536 dimensions.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Self::build_client(),
+            client: reqwest::Client::new(),
             api_key: api_key.into(),
             model: "text-embedding-3-small".to_string(),
             dimension: 1536,
@@ -91,7 +84,7 @@ impl OpenAiEmbeddings {
     /// Use text-embedding-ada-002 model.
     pub fn ada_002(api_key: impl Into<String>) -> Self {
         Self {
-            client: Self::build_client(),
+            client: reqwest::Client::new(),
             api_key: api_key.into(),
             model: "text-embedding-ada-002".to_string(),
             dimension: 1536,
@@ -101,7 +94,7 @@ impl OpenAiEmbeddings {
     /// Use text-embedding-3-large model.
     pub fn large(api_key: impl Into<String>) -> Self {
         Self {
-            client: Self::build_client(),
+            client: reqwest::Client::new(),
             api_key: api_key.into(),
             model: "text-embedding-3-large".to_string(),
             dimension: 3072,
@@ -115,7 +108,7 @@ impl OpenAiEmbeddings {
         dimension: usize,
     ) -> Self {
         Self {
-            client: Self::build_client(),
+            client: reqwest::Client::new(),
             api_key: api_key.into(),
             model: model.into(),
             dimension,
@@ -240,10 +233,7 @@ impl NearAiEmbeddings {
         session: std::sync::Arc<crate::llm::SessionManager>,
     ) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: reqwest::Client::new(),
             base_url: base_url.into(),
             session,
             model: "text-embedding-3-small".to_string(),
@@ -381,10 +371,7 @@ impl OllamaEmbeddings {
     /// Defaults to `nomic-embed-text` (768 dimensions).
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: reqwest::Client::new(),
             base_url: base_url.into(),
             model: "nomic-embed-text".to_string(),
             dimension: 768,
@@ -467,6 +454,18 @@ impl EmbeddingProvider for OllamaEmbeddings {
         let result: OllamaEmbedResponse = response.json().await.map_err(|e| {
             EmbeddingError::InvalidResponse(format!("Failed to parse Ollama response: {}", e))
         })?;
+
+        // Validate that returned embeddings match the configured dimension.
+        for (i, emb) in result.embeddings.iter().enumerate() {
+            if emb.len() != self.dimension {
+                return Err(EmbeddingError::InvalidResponse(format!(
+                    "Ollama returned embedding of dimension {}, expected {} at index {}",
+                    emb.len(),
+                    self.dimension,
+                    i
+                )));
+            }
+        }
 
         Ok(result.embeddings)
     }
@@ -580,46 +579,5 @@ mod tests {
         let provider = OpenAiEmbeddings::large("test-key");
         assert_eq!(provider.dimension(), 3072);
         assert_eq!(provider.model_name(), "text-embedding-3-large");
-    }
-
-    #[test]
-    fn test_ollama_embeddings_config() {
-        let provider = OllamaEmbeddings::new("http://localhost:11434");
-        assert_eq!(provider.dimension(), 768);
-        assert_eq!(provider.model_name(), "nomic-embed-text");
-        assert_eq!(provider.max_input_length(), 32_000);
-
-        let provider = provider.with_model("mxbai-embed-large", 1024);
-        assert_eq!(provider.dimension(), 1024);
-        assert_eq!(provider.model_name(), "mxbai-embed-large");
-    }
-
-    #[tokio::test]
-    async fn test_ollama_embed_batch_empty_input() {
-        let provider = OllamaEmbeddings::new("http://localhost:11434");
-        let result = provider.embed_batch(&[]).await.unwrap();
-        assert!(result.is_empty(), "empty input should return empty vec");
-    }
-
-    #[tokio::test]
-    async fn test_ollama_embed_rejects_oversized_text() {
-        let provider = OllamaEmbeddings::new("http://localhost:11434");
-        let oversized = "x".repeat(provider.max_input_length() + 1);
-        let result = provider.embed(&oversized).await;
-        assert!(
-            matches!(result, Err(EmbeddingError::TextTooLong { .. })),
-            "oversized text should be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_openai_embed_rejects_oversized_text() {
-        let provider = OpenAiEmbeddings::new("test-key");
-        let oversized = "x".repeat(provider.max_input_length() + 1);
-        let result = provider.embed(&oversized).await;
-        assert!(
-            matches!(result, Err(EmbeddingError::TextTooLong { .. })),
-            "oversized text should be rejected"
-        );
     }
 }

@@ -316,66 +316,16 @@ impl AppBuilder {
         ),
         anyhow::Error,
     > {
-        use crate::workspace::{NearAiEmbeddings, OllamaEmbeddings, OpenAiEmbeddings};
-
         let safety = Arc::new(SafetyLayer::new(&self.config.safety));
         tracing::info!("Safety layer initialized");
 
-        let tools = Arc::new(ToolRegistry::new());
-        tools.register_builtin_tools();
-        tracing::info!("Registered {} built-in tools", tools.count());
-
-        // Create embeddings provider if configured
-        let embeddings: Option<Arc<dyn EmbeddingProvider>> = if self.config.embeddings.enabled {
-            match self.config.embeddings.provider.as_str() {
-                "nearai" => {
-                    tracing::info!(
-                        "Embeddings enabled via NEAR AI (model: {})",
-                        self.config.embeddings.model
-                    );
-                    Some(Arc::new(
-                        NearAiEmbeddings::new(
-                            &self.config.llm.nearai.base_url,
-                            self.session.clone(),
-                        )
-                        .with_model(
-                            &self.config.embeddings.model,
-                            self.config.embeddings.effective_dimension(),
-                        ),
-                    ))
-                }
-                "ollama" => {
-                    tracing::info!(
-                        "Embeddings enabled via Ollama (model: {}, dim: {}, url: {})",
-                        self.config.embeddings.model,
-                        self.config.embeddings.effective_dimension(),
-                        self.config.embeddings.ollama_base_url,
-                    );
-                    Some(Arc::new(
-                        OllamaEmbeddings::new(&self.config.embeddings.ollama_base_url)
-                            .with_model(
-                                &self.config.embeddings.model,
-                                self.config.embeddings.effective_dimension(),
-                            ),
-                    ))
-                }
-                _ => {
-                    if let Some(api_key) = self.config.embeddings.openai_api_key() {
-                        tracing::info!(
-                            "Embeddings enabled via OpenAI (model: {})",
-                            self.config.embeddings.model
-                        );
-                        Some(Arc::new(OpenAiEmbeddings::with_model(
-                            api_key,
-                            &self.config.embeddings.model,
-                            self.config.embeddings.effective_dimension(),
-                        )))
-                    } else {
-                        tracing::warn!("Embeddings configured but OPENAI_API_KEY not set");
-                        None
-                    }
-                }
-            }
+        // Initialize tool registry with credential injection support
+        let credential_registry = Arc::new(SharedCredentialRegistry::new());
+        let tools = if let Some(ref ss) = self.secrets_store {
+            Arc::new(
+                ToolRegistry::new()
+                    .with_credentials(Arc::clone(&credential_registry), Arc::clone(ss)),
+            )
         } else {
             Arc::new(ToolRegistry::new())
         };
