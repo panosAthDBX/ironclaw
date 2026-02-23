@@ -80,7 +80,7 @@ dispatcher.rs::run_agentic_loop()
     ├─► Reasoning::respond_with_tools()
     │       └─► RespondResult::ToolCalls { tool_calls, content: Option<String> }
     │               │
-    │               ├─ content ──► SafetyLayer::sanitize_tool_output() ──► turn.set_narrative(sanitized_content)
+    │               ├─ content ──► SafetyLayer::process() ──► turn.set_narrative(sanitized_content)
     │               └─ tool_calls ──► dispatcher loop
     │                                    │
     │                                    ▼
@@ -203,12 +203,12 @@ All user-facing keys use `"reasoning"` as the top-level label (per requirement #
 Raw text (model output / content field)
     │
     ▼
-SafetyLayer::sanitize_tool_output("reasoning", text)
-    ├─► Length guard — max output size enforcement
-    ├─► LeakDetector — 15+ secret patterns (API keys, tokens, conn strings)
-                       Actions: block sentinel or redact mask
+SafetyLayer::process(text)
+    ├─► Sanitizer   — injection pattern detection, XML/HTML escaping
+    ├─► Validator   — length check, encoding, forbidden patterns
     ├─► Policy      — severity-based action (Block / Warn / Review / Sanitize)
-    └─► Sanitizer   — injection pattern detection, XML/HTML escaping
+    └─► LeakDetector — 15+ secret patterns (API keys, tokens, conn strings)
+                       Actions: Block (reject) | Redact (mask) | Warn (flag)
     │
     ▼
 Sanitized text → stored in Turn.narrative / TurnToolCall.rationale
@@ -218,7 +218,7 @@ Sanitized text → stored in Turn.narrative / TurnToolCall.rationale
 
 The sanitization is performed **once**, at write time, in the dispatcher immediately after receiving `RespondResult::ToolCalls.content`. The stored value is already sanitized; no additional sanitization is needed at read time (HTTP response, CLI output, SSE emission).
 
-If `SafetyLayer::sanitize_tool_output` returns blocked/truncated sentinel content, `Turn.narrative` is set to `None` and a `tracing::warn!` is emitted. The turn continues normally — reasoning omission must never block the agent loop.
+If `SafetyLayer::process` returns a `Block` action or an error, `Turn.narrative` is set to `None` and a `tracing::warn!` is emitted. The turn continues normally — reasoning omission must never block the agent loop.
 
 ### 6.3 No Raw CoT Exposure
 
@@ -312,7 +312,7 @@ A new first-class REPL command (requirement #10):
 
 Reasoning is exposed **inline on the existing turn-level response** (requirement #4). No new dedicated endpoint is added in v1; the `TurnInfo` DTO is extended with a `reasoning` field.
 
-**Existing:** `GET /api/chat/history?thread_id={thread_id}` → `HistoryResponse { turns: Vec<TurnInfo> }`
+**Existing:** `GET /api/chat/threads/{thread_id}/history` → `HistoryResponse { turns: Vec<TurnInfo> }`
 
 **Extended `TurnInfo`:**
 ```json
@@ -387,7 +387,7 @@ pub reasoning: Option<TurnReasoningInfo>,
 ### 8.4 Payload Example — Full Response
 
 ```http
-GET /api/chat/history?thread_id=7c9e6679-7425-40de-944b-e07fc1f90ae7
+GET /api/chat/threads/7c9e6679-7425-40de-944b-e07fc1f90ae7/history
 Authorization: Bearer <token>
 
 HTTP/1.1 200 OK
@@ -510,7 +510,7 @@ This means for a turn with two LLM iterations (tool call → tool call → text 
 ### 9.3 SSE Wire Format Example
 
 ```
-event: reasoning_update
+event: message
 data: {"type":"reasoning_update","thread_id":"7c9e...","session_id":"550e...","turn_number":3,"narrative":"I'll search memory first.","tool_decisions":[{"tool_name":"memory_search","rationale":"searched memory for project updates","outcome":"success","parallel_group":null}]}
 
 ```
@@ -534,7 +534,7 @@ The worker path does not have `SseManager` access directly; it uses `post_event(
 }
 ```
 
-The orchestrator's SSE bridge currently maps unknown worker event types to `SseEvent::JobStatus`; adding a dedicated `job_reasoning` event requires extending orchestrator event mapping and frontend listeners.
+The orchestrator's SSE bridge (`SseEvent::JobMessage`) forwards these to connected clients as `job_reasoning` events.
 
 ---
 
@@ -627,7 +627,7 @@ After `RespondResult::ToolCalls { content, tool_calls }`, extract and sanitize `
 | REPL channel | `src/channels/repl.rs` | Always-on reasoning block after each turn; `/reasoning [N|all]` command |
 | Web types | `src/channels/web/types.rs` | Add `TurnReasoningInfo`, `ToolDecisionInfo`, `ToolDecisionSsePayload`; extend `TurnInfo`; add `SseEvent::ReasoningUpdate` |
 | Web server | `src/channels/web/server.rs` | Populate `reasoning` field when building `TurnInfo` from `Turn` |
-| Safety | `src/safety/` | No changes needed — existing `SafetyLayer::sanitize_tool_output()` API is sufficient |
+| Safety | `src/safety/` | No changes needed — existing `SafetyLayer::process()` API is sufficient |
 
 ---
 
@@ -636,7 +636,7 @@ After `RespondResult::ToolCalls { content, tool_calls }`, extract and sanitize `
 ### 14.1 History with Reasoning — Single Tool Turn
 
 ```http
-GET /api/chat/history?thread_id={thread_id}
+GET /api/chat/threads/{thread_id}/history
 ```
 
 ```json
