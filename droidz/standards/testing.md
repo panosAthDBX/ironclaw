@@ -6,6 +6,7 @@
 - Keep unit tests close to implementation (`mod tests {}`) when that is the local convention.
 - Use `#[tokio::test]` for async behavior.
 - Prefer real implementations or lightweight stubs over complex mocks.
+- Run lint checks and address warnings before committing (`cargo clippy --all --benches --tests --examples --all-features`).
 
 ## Verification commands
 
