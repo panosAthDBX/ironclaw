@@ -11,16 +11,19 @@
 //! - Active health diagnostics (`doctor`)
 //! - Checking system health (`status`)
 
+mod completion;
 mod config;
 mod doctor;
 mod mcp;
 pub mod memory;
 pub mod oauth_defaults;
 mod pairing;
+mod registry;
 mod service;
 pub mod status;
 mod tool;
 
+pub use completion::Completion;
 pub use config::{ConfigCommand, run_config_command};
 pub use doctor::run_doctor_command;
 pub use mcp::{McpCommand, run_mcp_command};
@@ -29,6 +32,7 @@ pub use memory::MemoryCommand;
 pub use memory::run_memory_command;
 pub use memory::run_memory_command_with_db;
 pub use pairing::{PairingCommand, run_pairing_command, run_pairing_command_with_store};
+pub use registry::{RegistryCommand, run_registry_command};
 pub use service::{ServiceCommand, run_service_command};
 pub use status::run_status_command;
 pub use tool::{ToolCommand, run_tool_command};
@@ -90,6 +94,10 @@ pub enum Command {
     #[command(subcommand)]
     Tool(ToolCommand),
 
+    /// Browse and install extensions from the registry
+    #[command(subcommand)]
+    Registry(RegistryCommand),
+
     /// Manage MCP servers (hosted tool providers)
     #[command(subcommand)]
     Mcp(McpCommand),
@@ -111,6 +119,9 @@ pub enum Command {
 
     /// Show system health and diagnostics
     Status,
+
+    /// Generate shell completion scripts
+    Completion(Completion),
 
     /// Run as a sandboxed worker inside a Docker container (internal use).
     /// This is invoked automatically by the orchestrator, not by users directly.

@@ -85,6 +85,7 @@ pub struct Agent {
     pub(super) session_manager: Arc<SessionManager>,
     pub(super) context_monitor: ContextMonitor,
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
+    pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
 }
 
@@ -93,11 +94,13 @@ impl Agent {
     ///
     /// Optionally accepts pre-created `ContextManager` and `SessionManager` for sharing
     /// with external components (job tools, web gateway). Creates new ones if not provided.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AgentConfig,
         deps: AgentDeps,
-        channels: ChannelManager,
+        channels: Arc<ChannelManager>,
         heartbeat_config: Option<HeartbeatConfig>,
+        hygiene_config: Option<crate::config::HygieneConfig>,
         routine_config: Option<RoutineConfig>,
         context_manager: Option<Arc<ContextManager>>,
         session_manager: Option<Arc<SessionManager>>,
@@ -120,13 +123,14 @@ impl Agent {
         Self {
             config,
             deps,
-            channels: Arc::new(channels),
+            channels,
             context_manager,
             scheduler,
             router: Router::new(),
             session_manager,
             context_monitor: ContextMonitor::new(),
             heartbeat_config,
+            hygiene_config,
             routine_config,
         }
     }
@@ -354,14 +358,18 @@ impl Agent {
                         }
                     });
 
-                    tracing::info!(
-                        "Heartbeat enabled with {}s interval",
-                        hb_config.interval_secs
-                    );
+                    let hygiene = self
+                        .hygiene_config
+                        .as_ref()
+                        .map(|h| h.to_workspace_config())
+                        .unwrap_or_default();
+
                     Some(spawn_heartbeat(
                         config,
+                        hygiene,
                         workspace.clone(),
                         self.cheap_llm().clone(),
+                        self.safety().clone(),
                         Some(notify_tx),
                     ))
                 } else {
@@ -389,6 +397,7 @@ impl Agent {
                         self.llm().clone(),
                         Arc::clone(workspace),
                         notify_tx,
+                        Some(self.scheduler.clone()),
                     ));
 
                     // Register routine tools
@@ -491,21 +500,41 @@ impl Agent {
                         Ok(crate::hooks::HookOutcome::Continue {
                             modified: Some(new_content),
                         }) => {
-                            let _ = self
+                            if let Err(e) = self
                                 .channels
                                 .respond(&message, OutgoingResponse::text(new_content))
-                                .await;
+                                .await
+                            {
+                                tracing::error!(
+                                    channel = %message.channel,
+                                    error = %e,
+                                    "Failed to send response to channel"
+                                );
+                            }
                         }
                         _ => {
-                            let _ = self
+                            if let Err(e) = self
                                 .channels
                                 .respond(&message, OutgoingResponse::text(response))
-                                .await;
+                                .await
+                            {
+                                tracing::error!(
+                                    channel = %message.channel,
+                                    error = %e,
+                                    "Failed to send response to channel"
+                                );
+                            }
                         }
                     }
                 }
-                Ok(Some(_)) => {
+                Ok(Some(empty)) => {
                     // Empty response, nothing to send (e.g. approval handled via send_status)
+                    tracing::debug!(
+                        channel = %message.channel,
+                        user = %message.user_id,
+                        empty_len = empty.len(),
+                        "Suppressed empty response (not sent to channel)"
+                    );
                 }
                 Ok(None) => {
                     // Shutdown signal received (/quit, /exit, /shutdown)
@@ -514,10 +543,17 @@ impl Agent {
                 }
                 Err(e) => {
                     tracing::error!("Error handling message: {}", e);
-                    let _ = self
+                    if let Err(send_err) = self
                         .channels
                         .respond(&message, OutgoingResponse::text(format!("Error: {}", e)))
-                        .await;
+                        .await
+                    {
+                        tracing::error!(
+                            channel = %message.channel,
+                            error = %send_err,
+                            "Failed to send error response to channel"
+                        );
+                    }
                 }
             }
 
@@ -674,7 +710,15 @@ impl Agent {
 
         // Convert SubmissionResult to response string
         match result? {
-            SubmissionResult::Response { content } => Ok(Some(content)),
+            SubmissionResult::Response { content } => {
+                // Suppress silent replies (e.g. from group chat "nothing to say" responses)
+                if crate::llm::is_silent_reply(&content) {
+                    tracing::debug!("Suppressing silent reply token");
+                    Ok(None)
+                } else {
+                    Ok(Some(content))
+                }
+            }
             SubmissionResult::Ok { message } => Ok(message),
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             SubmissionResult::Interrupted => Ok(Some("Interrupted.".into())),

@@ -137,6 +137,8 @@ pub enum SseEvent {
         tool_name: String,
         description: String,
         parameters: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "auth_required")]
     AuthRequired {
@@ -344,6 +346,9 @@ pub struct ExtensionInfo {
     pub authenticated: bool,
     pub active: bool,
     pub tools: Vec<String>,
+    /// Whether this extension has configurable secrets (setup schema).
+    #[serde(default)]
+    pub needs_setup: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -367,6 +372,31 @@ pub struct InstallExtensionRequest {
     pub name: String,
     pub url: Option<String>,
     pub kind: Option<String>,
+}
+
+// --- Extension Setup ---
+
+#[derive(Debug, Serialize)]
+pub struct ExtensionSetupResponse {
+    pub name: String,
+    pub kind: String,
+    pub secrets: Vec<SecretFieldInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SecretFieldInfo {
+    pub name: String,
+    pub prompt: String,
+    pub optional: bool,
+    /// Whether this secret is already stored.
+    pub provided: bool,
+    /// Whether the secret will be auto-generated if left empty.
+    pub auto_generate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExtensionSetupRequest {
+    pub secrets: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,6 +434,50 @@ impl ActionResponse {
             instructions: None,
         }
     }
+}
+
+// --- Registry ---
+
+#[derive(Debug, Serialize)]
+pub struct RegistryEntryInfo {
+    pub name: String,
+    pub display_name: String,
+    pub kind: String,
+    pub description: String,
+    pub keywords: Vec<String>,
+    pub installed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistrySearchResponse {
+    pub entries: Vec<RegistryEntryInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegistrySearchQuery {
+    pub query: Option<String>,
+}
+
+// --- Pairing ---
+
+#[derive(Debug, Serialize)]
+pub struct PairingListResponse {
+    pub channel: String,
+    pub requests: Vec<PairingRequestInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairingRequestInfo {
+    pub code: String,
+    pub sender_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PairingApproveRequest {
+    pub code: String,
 }
 
 // --- Skills ---
@@ -785,12 +859,14 @@ mod tests {
             tool_name: "shell".to_string(),
             description: "Run ls".to_string(),
             parameters: "{}".to_string(),
+            thread_id: Some("t1".to_string()),
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
             WsServerMessage::Event { event_type, data } => {
                 assert_eq!(event_type, "approval_needed");
                 assert_eq!(data["tool_name"], "shell");
+                assert_eq!(data["thread_id"], "t1");
             }
             _ => panic!("Expected Event variant"),
         }
