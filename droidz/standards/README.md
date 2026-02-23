@@ -7,7 +7,7 @@
 1. Identify the work area (error handling, database, tool implementation, etc.).
 2. Read the corresponding standard file before making changes.
 3. Apply required checks from `review-discipline.md` before finishing work.
-4. Run `bash scripts/check-standards.sh` locally before opening or updating a PR.
+4. Run the required verification commands and review checks from these standards before opening or updating a PR.
 
 ## Standards files
 
@@ -25,9 +25,6 @@
 
 ## Enforcement
 
-Standards are enforced by:
+Standards are enforced through code review and required project verification commands (format, lint, and tests).
 
-- Local script: `scripts/check-standards.sh`
-- CI workflow: `.github/workflows/standards.yml`
-
-If script and docs disagree, update docs and script together in the same branch.
+If standards and implementation conventions disagree, update the standards in the same branch as the implementation change.
