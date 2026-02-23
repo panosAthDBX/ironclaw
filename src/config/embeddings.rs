@@ -21,8 +21,8 @@ pub struct EmbeddingsConfig {
     pub model: String,
     /// Ollama base URL (for Ollama provider). Defaults to http://localhost:11434.
     pub ollama_base_url: String,
-    /// Embedding vector dimension. Inferred from the model name when not set explicitly.
-    pub dimension: usize,
+    /// Embedding vector dimension. Auto-detected from known models when not set.
+    pub dimension: Option<usize>,
 }
 
 impl Default for EmbeddingsConfig {
@@ -33,25 +33,24 @@ impl Default for EmbeddingsConfig {
             enabled: false,
             provider: "openai".to_string(),
             openai_api_key: None,
-            model,
+            model: "text-embedding-3-small".to_string(),
             ollama_base_url: "http://localhost:11434".to_string(),
-            dimension,
+            dimension: None,
         }
     }
 }
 
-/// Infer the embedding dimension from a well-known model name.
-///
-/// Falls back to 1536 (OpenAI text-embedding-3-small default) for unknown models.
-fn default_dimension_for_model(model: &str) -> usize {
+/// Infer embedding dimension from well-known model names.
+fn infer_dimension(model: &str) -> usize {
     match model {
         "text-embedding-3-small" => 1536,
         "text-embedding-3-large" => 3072,
         "text-embedding-ada-002" => 1536,
         "nomic-embed-text" => 768,
         "mxbai-embed-large" => 1024,
-        "all-minilm" => 384,
-        _ => 1536,
+        "all-minilm" | "all-minilm:l6-v2" => 384,
+        "snowflake-arctic-embed" => 1024,
+        _ => 768, // Conservative default for unknown models
     }
 }
 
@@ -69,10 +68,22 @@ impl EmbeddingsConfig {
             .or_else(|| settings.ollama_base_url.clone())
             .unwrap_or_else(|| "http://localhost:11434".to_string());
 
-        let dimension =
-            parse_optional_env("EMBEDDING_DIMENSION", default_dimension_for_model(&model))?;
+        let dimension = optional_env("EMBEDDING_DIMENSION")?
+            .map(|s| s.parse::<usize>())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "EMBEDDING_DIMENSION".to_string(),
+                message: format!("must be a positive integer: {e}"),
+            })?;
 
-        let enabled = parse_bool_env("EMBEDDING_ENABLED", settings.embeddings.enabled)?;
+        let enabled = optional_env("EMBEDDING_ENABLED")?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "EMBEDDING_ENABLED".to_string(),
+                message: format!("must be 'true' or 'false': {e}"),
+            })?
+            .unwrap_or(settings.embeddings.enabled);
 
         Ok(Self {
             enabled,
@@ -89,63 +100,9 @@ impl EmbeddingsConfig {
         self.openai_api_key.as_ref().map(|s| s.expose_secret())
     }
 
-    /// Create the appropriate embedding provider based on configuration.
-    ///
-    /// Returns `None` if embeddings are disabled or the required credentials
-    /// are missing. The `nearai_base_url` and `session` are needed only for
-    /// the NEAR AI provider but must be passed unconditionally.
-    pub fn create_provider(
-        &self,
-        nearai_base_url: &str,
-        session: Arc<SessionManager>,
-    ) -> Option<Arc<dyn EmbeddingProvider>> {
-        if !self.enabled {
-            tracing::info!("Embeddings disabled (set EMBEDDING_ENABLED=true to enable)");
-            return None;
-        }
-
-        match self.provider.as_str() {
-            "nearai" => {
-                tracing::info!(
-                    "Embeddings enabled via NEAR AI (model: {}, dim: {})",
-                    self.model,
-                    self.dimension,
-                );
-                Some(Arc::new(
-                    crate::workspace::NearAiEmbeddings::new(nearai_base_url, session)
-                        .with_model(&self.model, self.dimension),
-                ))
-            }
-            "ollama" => {
-                tracing::info!(
-                    "Embeddings enabled via Ollama (model: {}, url: {}, dim: {})",
-                    self.model,
-                    self.ollama_base_url,
-                    self.dimension,
-                );
-                Some(Arc::new(
-                    crate::workspace::OllamaEmbeddings::new(&self.ollama_base_url)
-                        .with_model(&self.model, self.dimension),
-                ))
-            }
-            _ => {
-                if let Some(api_key) = self.openai_api_key() {
-                    tracing::info!(
-                        "Embeddings enabled via OpenAI (model: {}, dim: {})",
-                        self.model,
-                        self.dimension,
-                    );
-                    Some(Arc::new(crate::workspace::OpenAiEmbeddings::with_model(
-                        api_key,
-                        &self.model,
-                        self.dimension,
-                    )))
-                } else {
-                    tracing::warn!("Embeddings configured but OPENAI_API_KEY not set");
-                    None
-                }
-            }
-        }
+    /// Get the embedding dimension — explicit override, or inferred from model name.
+    pub fn effective_dimension(&self) -> usize {
+        self.dimension.unwrap_or_else(|| infer_dimension(&self.model))
     }
 }
 
@@ -156,13 +113,93 @@ mod tests {
     use crate::settings::{EmbeddingsSettings, Settings};
 
     /// Clear all embedding-related env vars.
+    /// Clear all embedding-related env vars.
     fn clear_embedding_env() {
         // SAFETY: Only called under ENV_MUTEX in tests.
         unsafe {
             std::env::remove_var("EMBEDDING_ENABLED");
             std::env::remove_var("EMBEDDING_PROVIDER");
             std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("EMBEDDING_DIMENSION");
             std::env::remove_var("OPENAI_API_KEY");
+        }
+    }
+
+    #[test]
+    fn infer_dimension_known_models() {
+        assert_eq!(infer_dimension("text-embedding-3-small"), 1536);
+        assert_eq!(infer_dimension("text-embedding-3-large"), 3072);
+        assert_eq!(infer_dimension("text-embedding-ada-002"), 1536);
+        assert_eq!(infer_dimension("nomic-embed-text"), 768);
+        assert_eq!(infer_dimension("mxbai-embed-large"), 1024);
+        assert_eq!(infer_dimension("all-minilm"), 384);
+        assert_eq!(infer_dimension("all-minilm:l6-v2"), 384);
+        assert_eq!(infer_dimension("snowflake-arctic-embed"), 1024);
+    }
+
+    #[test]
+    fn infer_dimension_unknown_model_returns_default() {
+        assert_eq!(infer_dimension("some-custom-model"), 768);
+        assert_eq!(infer_dimension(""), 768);
+    }
+
+    #[test]
+    fn effective_dimension_uses_explicit_override() {
+        let config = EmbeddingsConfig {
+            dimension: Some(512),
+            model: "nomic-embed-text".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_dimension(), 512);
+    }
+
+    #[test]
+    fn effective_dimension_infers_from_model_when_none() {
+        let config = EmbeddingsConfig {
+            dimension: None,
+            model: "text-embedding-3-large".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_dimension(), 3072);
+    }
+
+    #[test]
+    fn embedding_dimension_env_parsed() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_embedding_env();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("EMBEDDING_DIMENSION", "1024");
+        }
+
+        let settings = Settings::default();
+        let config = EmbeddingsConfig::resolve(&settings).expect("resolve should succeed");
+        assert_eq!(config.dimension, Some(1024));
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("EMBEDDING_DIMENSION");
+        }
+    }
+
+    #[test]
+    fn embedding_dimension_invalid_value() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_embedding_env();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("EMBEDDING_DIMENSION", "not-a-number");
+        }
+
+        let settings = Settings::default();
+        let result = EmbeddingsConfig::resolve(&settings);
+        assert!(result.is_err(), "invalid EMBEDDING_DIMENSION should fail");
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("EMBEDDING_DIMENSION");
         }
     }
 

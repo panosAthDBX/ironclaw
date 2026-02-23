@@ -118,17 +118,18 @@ src/
 │   └── leak_detector.rs # Secret detection (API keys, tokens, etc.)
 │
 ├── llm/                # LLM integration (multi-provider)
-│   ├── mod.rs          # Provider factory, LlmBackend enum
-│   ├── provider.rs     # LlmProvider trait, message types
-│   ├── nearai_chat.rs  # NEAR AI Chat Completions provider (session token + API key auth)
+│   ├── provider.rs     # LlmProvider trait, message types, sanitize_tool_messages
+│   ├── nearai.rs       # NEAR AI Responses API implementation
+│   ├── nearai_chat.rs  # NEAR AI Chat Completions API provider
+│   ├── openai_compatible_chat.rs # OpenAI-compatible Chat Completions (vLLM, LiteLLM, etc.)
+│   ├── rig_adapter.rs  # Rig framework adapter (OpenAI/Anthropic direct)
 │   ├── reasoning.rs    # Planning, tool selection, evaluation
 │   ├── session.rs      # Session token management with auto-renewal
-│   ├── circuit_breaker.rs # Circuit breaker for provider failures
-│   ├── retry.rs        # Retry with exponential backoff
-│   ├── failover.rs     # Multi-provider failover chain
-│   ├── response_cache.rs # LLM response caching
-│   ├── costs.rs        # Token cost tracking
-│   └── rig_adapter.rs  # Rig framework adapter
+│   ├── retry.rs        # Retry logic with exponential backoff
+│   ├── failover.rs     # Provider failover chain
+│   ├── circuit_breaker.rs # Circuit breaker for provider health
+│   ├── response_cache.rs # Response caching
+│   └── costs.rs        # Per-model cost tables
 │
 ├── tools/              # Extensible tool system
 │   ├── tool.rs         # Tool trait, ToolOutput, ToolError
@@ -173,7 +174,7 @@ src/
 │   ├── mod.rs          # Workspace struct, memory operations
 │   ├── document.rs     # MemoryDocument, MemoryChunk, WorkspaceEntry
 │   ├── chunker.rs      # Document chunking (800 tokens, 15% overlap)
-│   ├── embeddings.rs   # EmbeddingProvider trait, OpenAI implementation
+│   ├── embeddings.rs   # EmbeddingProvider trait (OpenAI, NEAR AI, Ollama)
 │   ├── search.rs       # Hybrid search with RRF algorithm
 │   └── repository.rs   # PostgreSQL CRUD and search operations
 │
@@ -357,8 +358,16 @@ MAX_PARALLEL_JOBS=5
 OPENAI_API_KEY=sk-...                   # For OpenAI embeddings
 # Or use NEAR AI embeddings:
 # EMBEDDING_PROVIDER=nearai
+# Or use Ollama embeddings:
+# EMBEDDING_PROVIDER=ollama
+# OLLAMA_BASE_URL=http://localhost:11434
 # EMBEDDING_ENABLED=true
-EMBEDDING_MODEL=text-embedding-3-small  # or text-embedding-3-large
+EMBEDDING_MODEL=text-embedding-3-small  # or text-embedding-3-large, nomic-embed-text
+# EMBEDDING_DIMENSION=1536             # Auto-detected from model; override if needed
+
+# OpenAI/Anthropic direct (override base URL for proxies)
+# OPENAI_BASE_URL=http://localhost:8318
+# ANTHROPIC_BASE_URL=http://localhost:8318
 
 # Heartbeat (proactive periodic execution)
 HEARTBEAT_ENABLED=true
@@ -407,7 +416,12 @@ TINFOIL_MODEL=kimi-k2-5               # Default model
 
 ### LLM Providers
 
-IronClaw supports multiple LLM backends via the `LLM_BACKEND` env var: `nearai` (default), `openai`, `anthropic`, `ollama`, `openai_compatible`, and `tinfoil`.
+IronClaw supports multiple LLM providers:
+
+- **NEAR AI** (`nearai`, `nearai_chat`) — Uses the NEAR AI chat-api (`https://api.near.ai/v1/responses`) with session token auth. Unified access to multiple models (OpenAI, Anthropic, etc.) with usage tracking.
+- **OpenAI Direct** (`rig_adapter`) — Direct OpenAI API via `OPENAI_API_KEY`. Supports `OPENAI_BASE_URL` for proxies.
+- **Anthropic Direct** (`rig_adapter`) — Direct Anthropic API via `ANTHROPIC_API_KEY`. Supports `ANTHROPIC_BASE_URL` for proxies.
+- **OpenAI-Compatible** (`openai_compatible_chat`) — Any `/v1/chat/completions` endpoint (vLLM, LiteLLM, local proxies). Robust tool-call name reconciliation, retry with backoff.
 
 **NEAR AI** -- Uses the Chat Completions API with dual auth support. Session token auth (default): authenticates with session tokens (`sess_xxx`) obtained via browser OAuth (GitHub/Google), base URL defaults to `https://private.near.ai`. API key auth: set `NEARAI_API_KEY` (from `cloud.near.ai`), base URL defaults to `https://cloud-api.near.ai`. Both modes use the same Chat Completions endpoint. Tool messages are flattened to plain text for compatibility. Set `NEARAI_SESSION_TOKEN` env var for hosting providers that inject tokens via environment.
 
@@ -630,7 +644,27 @@ Key test patterns:
 
 ## Tool Architecture
 
-**Keep tool-specific logic out of the main agent codebase.** The main agent provides generic infrastructure; tools are self-contained units that declare their requirements through `capabilities.json` files (API endpoints, credentials, rate limits, auth setup). Service-specific auth flows, CLI commands, and configuration do not belong in the main agent.
+- ✅ **Workspace integration** - Memory tools registered, workspace passed to Agent and heartbeat
+- ✅ **WASM sandboxing** - Full implementation in `tools/wasm/` with fuel metering, memory limits, capabilities
+- ✅ **Dynamic tool building** - `tools/builder/` has LlmSoftwareBuilder with iterative build loop
+- ✅ **HTTP webhook security** - Secret validation implemented, proper error handling (no panics)
+- ✅ **Embeddings integration** - OpenAI, NEAR AI, and Ollama providers wired to workspace for semantic search
+- ✅ **Workspace system prompt** - Identity files (AGENTS.md, SOUL.md, USER.md, IDENTITY.md) injected into LLM context
+- ✅ **Heartbeat notifications** - Route through channel manager (broadcast API) instead of logging-only
+- ✅ **Auto-context compaction** - Triggers automatically when context exceeds threshold
+- ✅ **Embedding backfill** - Runs on startup when embeddings provider is enabled
+- ✅ **Clippy clean** - All warnings addressed via config struct refactoring
+- ✅ **Tool approval enforcement** - Tools with `requires_approval()` (shell, http, file write/patch, build_software) now gate execution, track auto-approved tools per session
+- ✅ **Tool definition refresh** - Tool definitions refreshed each iteration so newly built tools become visible in same session
+- ✅ **Worker tool call handling** - Uses `respond_with_tools()` to properly execute tool calls when `select_tools()` returns empty
+- ✅ **Gateway control plane** - Web gateway with 40+ API endpoints, SSE/WebSocket
+- ✅ **Web Control UI** - Browser-based dashboard with chat, memory, jobs, logs, extensions, routines
+- ✅ **Slack/Telegram channels** - Implemented as WASM tools
+- ✅ **Docker sandbox** - Orchestrator/worker containers with per-job auth
+- ✅ **Claude Code mode** - Delegate jobs to Claude CLI inside containers
+- ✅ **Routines system** - Cron, event, webhook, and manual triggers with guardrails
+- ✅ **Extension management** - Install, auth, activate MCP/WASM extensions via CLI and web UI
+- ✅ **libSQL/Turso backend** - Database trait abstraction (`src/db/`), feature-gated dual backend support (postgres/libsql), embedded SQLite for zero-dependency local mode
 
 Tools can be built as **WASM** (sandboxed, credential-injected, single binary) or **MCP servers** (ecosystem of pre-built servers, any language, but no sandbox). Both are first-class via `ironclaw tool install`. Auth is declared in capabilities files with OAuth and manual token entry support.
 

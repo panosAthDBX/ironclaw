@@ -311,78 +311,13 @@ impl Agent {
                         }
                     }
 
-                    // === Phase 1: Preflight (sequential) ===
-                    // Walk tool_calls checking approval and hooks. Classify
-                    // each tool as Rejected (by hook) or Runnable. Stop at the
-                    // first tool that needs approval.
-                    //
-                    // Outcomes are indexed by original tool_calls position so
-                    // Phase 3 can emit results in the correct order.
-                    enum PreflightOutcome {
-                        /// Hook rejected/blocked this tool; contains the error message.
-                        Rejected(String),
-                        /// Tool passed preflight and will be executed.
-                        Runnable,
-                    }
-                    let mut preflight: Vec<(crate::llm::ToolCall, PreflightOutcome)> = Vec::new();
-                    let mut runnable: Vec<(usize, crate::llm::ToolCall)> = Vec::new();
-                    let mut approval_needed: Option<(
-                        usize,
-                        crate::llm::ToolCall,
-                        Arc<dyn crate::tools::Tool>,
-                    )> = None;
-
-                    for (idx, original_tc) in tool_calls.iter().enumerate() {
-                        let mut tc = original_tc.clone();
-
-                        // Hook: BeforeToolCall (runs before approval so hooks can
-                        // modify parameters — approval is checked on final params)
-                        let event = crate::hooks::HookEvent::ToolCall {
-                            tool_name: tc.name.clone(),
-                            parameters: tc.arguments.clone(),
-                            user_id: message.user_id.clone(),
-                            context: "chat".to_string(),
-                        };
-                        match self.hooks().run(&event).await {
-                            Err(crate::hooks::HookError::Rejected { reason }) => {
-                                preflight.push((
-                                    tc,
-                                    PreflightOutcome::Rejected(format!(
-                                        "Tool call rejected by hook: {}",
-                                        reason
-                                    )),
-                                ));
-                                continue; // skip to next tool (not infinite: using for loop)
-                            }
-                            Err(err) => {
-                                preflight.push((
-                                    tc,
-                                    PreflightOutcome::Rejected(format!(
-                                        "Tool call blocked by hook policy: {}",
-                                        err
-                                    )),
-                                ));
-                                continue;
-                            }
-                            Ok(crate::hooks::HookOutcome::Continue {
-                                modified: Some(new_params),
-                            }) => match serde_json::from_str(&new_params) {
-                                Ok(parsed) => tc.arguments = parsed,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        tool = %tc.name,
-                                        "Hook returned non-JSON modification for ToolCall, ignoring: {}",
-                                        e
-                                    );
-                                }
-                            },
-                            _ => {}
-                        }
-
-                        // Check if tool requires approval on the final (post-hook)
-                        // parameters. Skipped when auto_approve_tools is set.
-                        if !self.config.auto_approve_tools
-                            && let Some(tool) = self.tools().get(&tc.name).await
+                    // Execute tools in order (with approval checking and hook interception)
+                    let mut idx = 0usize;
+                    while idx < tool_calls.len() {
+                        let mut tc = tool_calls[idx].clone();
+                        // Check if tool requires approval
+                        if let Some(tool) = self.tools().get(&tc.name).await
+                            && tool.requires_approval()
                         {
                             use crate::tools::ApprovalRequirement;
                             let needs_approval = match tool.requires_approval(&tc.arguments) {
@@ -394,9 +329,32 @@ impl Agent {
                                 ApprovalRequirement::Always => true,
                             };
 
-                            if needs_approval {
-                                approval_needed = Some((idx, tc, tool));
-                                break; // remaining tools are deferred
+                            // Override auto-approval for destructive parameters
+                            // (e.g. `rm -rf`, `git push --force` in shell commands).
+                            if is_auto_approved && tool.requires_approval_for(&tc.arguments) {
+                                tracing::info!(
+                                    tool = %tc.name,
+                                    "Parameters require explicit approval despite auto-approve"
+                                );
+                                is_auto_approved = false;
+                            }
+
+                            if !is_auto_approved {
+                                // Need approval - store pending request and return.
+                                // Preserve remaining tool calls from this same assistant message,
+                                // so resuming after approval never leaves orphaned tool_use IDs.
+                                let deferred_tool_calls = tool_calls[idx + 1..].to_vec();
+                                let pending = PendingApproval {
+                                    request_id: Uuid::new_v4(),
+                                    tool_name: tc.name.clone(),
+                                    parameters: tc.arguments.clone(),
+                                    description: tool.description().to_string(),
+                                    tool_call_id: tc.id.clone(),
+                                    context_messages: context_messages.clone(),
+                                    deferred_tool_calls,
+                                };
+
+                                return Ok(AgenticLoopResult::NeedApproval { pending });
                             }
                         }
 
@@ -663,7 +621,13 @@ impl Agent {
                             deferred_tool_calls: tool_calls[approval_idx + 1..].to_vec(),
                         };
 
-                        return Ok(AgenticLoopResult::NeedApproval { pending });
+                        context_messages.push(ChatMessage::tool_result(
+                            &tc.id,
+                            &tc.name,
+                            result_content,
+                        ));
+
+                        idx += 1;
                     }
                 }
             }

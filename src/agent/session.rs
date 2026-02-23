@@ -1006,4 +1006,55 @@ mod tests {
             ThreadState::Processing
         );
     }
+
+    #[test]
+    fn pending_approval_serde_round_trip_with_deferred_tools() {
+        let pending = PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "shell".to_string(),
+            parameters: serde_json::json!({"command": "ls"}),
+            description: "run shell command".to_string(),
+            tool_call_id: "call_1".to_string(),
+            context_messages: vec![ChatMessage::user("do it")],
+            deferred_tool_calls: vec![
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "http".to_string(),
+                    arguments: serde_json::json!({"url": "https://example.com"}),
+                },
+                ToolCall {
+                    id: "call_3".to_string(),
+                    name: "echo".to_string(),
+                    arguments: serde_json::json!({"text": "hello"}),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&pending).expect("serialize");
+        let restored: PendingApproval = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.tool_name, "shell");
+        assert_eq!(restored.deferred_tool_calls.len(), 2);
+        assert_eq!(restored.deferred_tool_calls[0].name, "http");
+        assert_eq!(restored.deferred_tool_calls[1].name, "echo");
+    }
+
+    #[test]
+    fn pending_approval_serde_backward_compat_without_deferred() {
+        // Simulates deserializing old data that lacks the deferred_tool_calls field
+        let json = r#"{
+            "request_id": "00000000-0000-0000-0000-000000000001",
+            "tool_name": "shell",
+            "parameters": {},
+            "description": "test",
+            "tool_call_id": "call_1",
+            "context_messages": []
+        }"#;
+
+        let restored: PendingApproval = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            restored.deferred_tool_calls.is_empty(),
+            "missing field should default to empty vec"
+        );
+    }
 }

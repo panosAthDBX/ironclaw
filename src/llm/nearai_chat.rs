@@ -43,23 +43,27 @@ pub struct NearAiChatProvider {
     session: Arc<SessionManager>,
     active_model: std::sync::RwLock<String>,
     flatten_tool_messages: bool,
-    /// Per-model pricing fetched from the NEAR AI `/v1/model/list` endpoint.
-    /// Maps model ID → (input_cost_per_token, output_cost_per_token).
-    pricing: Arc<std::sync::RwLock<HashMap<String, (Decimal, Decimal)>>>,
 }
 
 impl NearAiChatProvider {
-    /// Create a new NEAR AI Chat Completions provider.
-    ///
-    /// Auth mode is determined by `config.api_key`:
-    /// - If set, uses Bearer API key auth
-    /// - If not set, uses session token auth via `SessionManager`
+    /// Create a new NEAR AI chat completions provider with API key auth.
     ///
     /// By default this enables tool-message flattening for compatibility with
-    /// providers that reject `role: "tool"` messages.
-    pub fn new(config: NearAiConfig, session: Arc<SessionManager>) -> Result<Self, LlmError> {
-        Self::new_with_flatten(config, session, true)
+    /// providers that reject `role: "tool"` messages (e.g. NEAR cloud-api).
+    pub fn new(config: NearAiConfig) -> Result<Self, LlmError> {
+        Self::new_with_flatten(config, true)
     }
+
+    /// Create a chat completions provider with configurable tool-message flattening.
+    pub fn new_with_flatten(
+        config: NearAiConfig,
+        flatten_tool_messages: bool,
+    ) -> Result<Self, LlmError> {
+        if config.api_key.is_none() {
+            return Err(LlmError::AuthFailed {
+                provider: "nearai_chat".to_string(),
+            });
+        }
 
     /// Create a chat completions provider with configurable tool-message flattening.
     pub fn new_with_flatten(
@@ -84,41 +88,7 @@ impl NearAiChatProvider {
             session,
             active_model,
             flatten_tool_messages,
-            pricing,
-        };
-
-        // Fire-and-forget background pricing fetch — don't block startup.
-        // Only spawns when a tokio runtime is active (skipped in sync tests).
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let client = provider.client.clone();
-            let base_url = provider.config.base_url.clone();
-            let api_key = provider.config.api_key.clone();
-            let session = provider.session.clone();
-            let pricing = provider.pricing.clone();
-
-            handle.spawn(async move {
-                match fetch_pricing(&client, &base_url, api_key.as_ref(), &session).await {
-                    Ok(map) if !map.is_empty() => {
-                        tracing::info!("Loaded NEAR AI pricing for {} model(s)", map.len());
-                        match pricing.write() {
-                            Ok(mut guard) => *guard = map,
-                            Err(poisoned) => *poisoned.into_inner() = map,
-                        }
-                    }
-                    Ok(_) => {
-                        tracing::debug!("NEAR AI pricing endpoint returned no pricing data");
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "Could not fetch NEAR AI pricing (will use fallback): {}",
-                            e
-                        );
-                    }
-                }
-            });
-        }
-
-        Ok(provider)
+        })
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -395,7 +365,6 @@ impl NearAiChatProvider {
 #[async_trait]
 impl LlmProvider for NearAiChatProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let model = req.model.unwrap_or_else(|| self.active_model_name());
         let mut raw_messages = req.messages;
         crate::llm::provider::sanitize_tool_messages(&mut raw_messages);
         let messages: Vec<ChatCompletionMessage> =
@@ -451,7 +420,6 @@ impl LlmProvider for NearAiChatProvider {
         &self,
         req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let model = req.model.unwrap_or_else(|| self.active_model_name());
         let mut raw_messages = req.messages;
         crate::llm::provider::sanitize_tool_messages(&mut raw_messages);
         let messages: Vec<ChatCompletionMessage> =

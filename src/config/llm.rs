@@ -64,7 +64,7 @@ impl std::fmt::Display for LlmBackend {
 pub struct OpenAiDirectConfig {
     pub api_key: SecretString,
     pub model: String,
-    /// Optional base URL override (e.g. for proxies like VibeProxy).
+    /// Optional base URL override (e.g. for proxies).
     pub base_url: Option<String>,
 }
 
@@ -73,7 +73,7 @@ pub struct OpenAiDirectConfig {
 pub struct AnthropicDirectConfig {
     pub api_key: SecretString,
     pub model: String,
-    /// Optional base URL override (e.g. for proxies like VibeProxy).
+    /// Optional base URL override (e.g. for proxies).
     pub base_url: Option<String>,
 }
 

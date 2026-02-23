@@ -30,6 +30,14 @@ use ironclaw::{
     },
     pairing::PairingStore,
     secrets::SecretsStore,
+    tools::{
+        ToolRegistry,
+        mcp::{McpClient, McpSessionManager, config::load_mcp_servers_from_db, is_authenticated},
+        wasm::{WasmToolLoader, WasmToolRuntime, load_dev_tools},
+    },
+    workspace::{
+        EmbeddingProvider, NearAiEmbeddings, OllamaEmbeddings, OpenAiEmbeddings, Workspace,
+    },
 };
 
 #[cfg(any(feature = "postgres", feature = "libsql"))]
@@ -67,8 +75,70 @@ async fn main() -> anyhow::Result<()> {
             return run_mcp_command(mcp_cmd.clone()).await;
         }
         Some(Command::Memory(mem_cmd)) => {
-            init_cli_tracing();
-            return run_memory_command(mem_cmd).await;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            // Memory commands need database (and optionally embeddings)
+            let config = Config::from_env()
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            // Set up embeddings if available
+            let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
+                auth_base_url: config.llm.nearai.auth_base_url.clone(),
+                session_path: config.llm.nearai.session_path.clone(),
+            })
+            .await;
+
+            let embeddings: Option<Arc<dyn ironclaw::workspace::EmbeddingProvider>> =
+                if config.embeddings.enabled {
+                    match config.embeddings.provider.as_str() {
+                        "nearai" => Some(Arc::new(
+                            ironclaw::workspace::NearAiEmbeddings::new(
+                                &config.llm.nearai.base_url,
+                                session,
+                            )
+                            .with_model(
+                                &config.embeddings.model,
+                                config.embeddings.effective_dimension(),
+                            ),
+                        )),
+                        "ollama" => Some(Arc::new(
+                            ironclaw::workspace::OllamaEmbeddings::new(
+                                &config.embeddings.ollama_base_url,
+                            )
+                            .with_model(
+                                &config.embeddings.model,
+                                config.embeddings.effective_dimension(),
+                            ),
+                        )),
+                        _ => {
+                            if let Some(api_key) = config.embeddings.openai_api_key() {
+                                Some(Arc::new(ironclaw::workspace::OpenAiEmbeddings::with_model(
+                                    api_key,
+                                    &config.embeddings.model,
+                                    config.embeddings.effective_dimension(),
+                                )))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            // Create a Database-trait-backed workspace for the memory command
+            let db: Arc<dyn ironclaw::db::Database> =
+                ironclaw::db::connect_from_config(&config.database)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            return ironclaw::cli::run_memory_command_with_db(mem_cmd.clone(), db, embeddings)
+                .await;
         }
         Some(Command::Pairing(pairing_cmd)) => {
             init_cli_tracing();
@@ -220,6 +290,367 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Orchestrator / container job manager ────────────────────────────
 
+    // Wrap in failover if a fallback model is configured
+    let llm: Arc<dyn LlmProvider> =
+        if let Some(fallback_model) = config.llm.nearai.fallback_model.as_ref() {
+            if fallback_model == &config.llm.nearai.model {
+                tracing::warn!(
+                    "fallback_model is the same as primary model, failover may not be effective"
+                );
+            }
+            let mut fallback_config = config.llm.nearai.clone();
+            fallback_config.model = fallback_model.clone();
+            let fallback = create_llm_provider_with_config(&fallback_config, session.clone())?;
+            tracing::info!(
+                primary = %llm.model_name(),
+                fallback = %fallback.model_name(),
+                "LLM failover enabled"
+            );
+            let cooldown_config = CooldownConfig {
+                cooldown_duration: std::time::Duration::from_secs(
+                    config.llm.nearai.failover_cooldown_secs,
+                ),
+                failure_threshold: config.llm.nearai.failover_cooldown_threshold,
+            };
+            Arc::new(FailoverProvider::with_cooldown(
+                vec![llm, fallback],
+                cooldown_config,
+            )?)
+        } else {
+            llm
+        };
+
+    // Wrap in circuit breaker if configured
+    let llm: Arc<dyn LlmProvider> =
+        if let Some(threshold) = config.llm.nearai.circuit_breaker_threshold {
+            let cb_config = CircuitBreakerConfig {
+                failure_threshold: threshold,
+                recovery_timeout: std::time::Duration::from_secs(
+                    config.llm.nearai.circuit_breaker_recovery_secs,
+                ),
+                ..CircuitBreakerConfig::default()
+            };
+            tracing::info!(
+                threshold,
+                recovery_secs = config.llm.nearai.circuit_breaker_recovery_secs,
+                "LLM circuit breaker enabled"
+            );
+            Arc::new(CircuitBreakerProvider::new(llm, cb_config))
+        } else {
+            llm
+        };
+
+    // Wrap in response cache if configured
+    let llm: Arc<dyn LlmProvider> = if config.llm.nearai.response_cache_enabled {
+        let rc_config = ResponseCacheConfig {
+            ttl: std::time::Duration::from_secs(config.llm.nearai.response_cache_ttl_secs),
+            max_entries: config.llm.nearai.response_cache_max_entries,
+        };
+        tracing::info!(
+            ttl_secs = config.llm.nearai.response_cache_ttl_secs,
+            max_entries = config.llm.nearai.response_cache_max_entries,
+            "LLM response cache enabled"
+        );
+        Arc::new(CachedProvider::new(llm, rc_config))
+    } else {
+        llm
+    };
+
+    // Initialize cheap LLM provider for lightweight tasks (heartbeat, evaluation)
+    let cheap_llm = create_cheap_llm_provider(&config.llm, session.clone())?;
+    if let Some(ref cheap) = cheap_llm {
+        tracing::info!("Cheap LLM provider initialized: {}", cheap.model_name());
+    }
+
+    // Initialize safety layer
+    let safety = Arc::new(SafetyLayer::new(&config.safety));
+    tracing::info!("Safety layer initialized");
+
+    // Initialize tool registry
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register_builtin_tools();
+    tracing::info!("Registered {} built-in tools", tools.count());
+
+    // Create embeddings provider if configured
+    let embeddings: Option<Arc<dyn EmbeddingProvider>> = if config.embeddings.enabled {
+        match config.embeddings.provider.as_str() {
+            "nearai" => {
+                tracing::info!(
+                    "Embeddings enabled via NEAR AI (model: {})",
+                    config.embeddings.model
+                );
+                Some(Arc::new(
+                    NearAiEmbeddings::new(&config.llm.nearai.base_url, session.clone())
+                        .with_model(
+                            &config.embeddings.model,
+                            config.embeddings.effective_dimension(),
+                        ),
+                ))
+            }
+            "ollama" => {
+                tracing::info!(
+                    "Embeddings enabled via Ollama (model: {}, dim: {}, url: {})",
+                    config.embeddings.model,
+                    config.embeddings.effective_dimension(),
+                    config.embeddings.ollama_base_url,
+                );
+                Some(Arc::new(
+                    OllamaEmbeddings::new(&config.embeddings.ollama_base_url)
+                        .with_model(
+                            &config.embeddings.model,
+                            config.embeddings.effective_dimension(),
+                        ),
+                ))
+            }
+            _ => {
+                // Default to OpenAI for unknown providers
+                if let Some(api_key) = config.embeddings.openai_api_key() {
+                    tracing::info!(
+                        "Embeddings enabled via OpenAI (model: {})",
+                        config.embeddings.model
+                    );
+                    Some(Arc::new(OpenAiEmbeddings::with_model(
+                        api_key,
+                        &config.embeddings.model,
+                        config.embeddings.effective_dimension(),
+                    )))
+                } else {
+                    tracing::warn!("Embeddings configured but OPENAI_API_KEY not set");
+                    None
+                }
+            }
+        }
+    } else {
+        tracing::info!("Embeddings disabled (set OPENAI_API_KEY or EMBEDDING_ENABLED=true)");
+        None
+    };
+
+    // Register memory tools if database is available
+    if let Some(ref db) = db {
+        let mut workspace = Workspace::new_with_db("default", Arc::clone(db));
+        if let Some(ref emb) = embeddings {
+            workspace = workspace.with_embeddings(emb.clone());
+        }
+        let workspace = Arc::new(workspace);
+        tools.register_memory_tools(workspace);
+    }
+
+    // Register builder tool if enabled.
+    // When sandbox is enabled and allow_local_tools is false, skip builder registration
+    // because register_builder_tool also registers dev tools (shell, file ops) that would
+    // bypass the sandbox. The builder runs inside containers instead.
+    if config.builder.enabled && (config.agent.allow_local_tools || !config.sandbox.enabled) {
+        tools
+            .register_builder_tool(
+                llm.clone(),
+                safety.clone(),
+                Some(config.builder.to_builder_config()),
+            )
+            .await;
+        tracing::info!("Builder mode enabled");
+    }
+
+    let mcp_session_manager = Arc::new(McpSessionManager::new());
+
+    // Create WASM tool runtime (sync, just builds the wasmtime engine)
+    let wasm_tool_runtime: Option<Arc<WasmToolRuntime>> =
+        if config.wasm.enabled && config.wasm.tools_dir.exists() {
+            match WasmToolRuntime::new(config.wasm.to_runtime_config()) {
+                Ok(runtime) => Some(Arc::new(runtime)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize WASM runtime: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Load WASM tools and MCP servers concurrently.
+    // Both register into the shared ToolRegistry (RwLock-based) so concurrent writes are safe.
+    let wasm_tools_future = async {
+        if let Some(ref runtime) = wasm_tool_runtime {
+            let mut loader = WasmToolLoader::new(Arc::clone(runtime), Arc::clone(&tools));
+            if let Some(ref secrets) = secrets_store {
+                loader = loader.with_secrets_store(Arc::clone(secrets));
+            }
+
+            // Load installed tools from ~/.ironclaw/tools/
+            match loader.load_from_dir(&config.wasm.tools_dir).await {
+                Ok(results) => {
+                    if !results.loaded.is_empty() {
+                        tracing::info!(
+                            "Loaded {} WASM tools from {}",
+                            results.loaded.len(),
+                            config.wasm.tools_dir.display()
+                        );
+                    }
+                    for (path, err) in &results.errors {
+                        tracing::warn!("Failed to load WASM tool {}: {}", path.display(), err);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to scan WASM tools directory: {}", e);
+                }
+            }
+
+            // Load dev tools from build artifacts (overrides installed if newer)
+            match load_dev_tools(&loader, &config.wasm.tools_dir).await {
+                Ok(results) => {
+                    if !results.loaded.is_empty() {
+                        tracing::info!(
+                            "Loaded {} dev WASM tools from build artifacts",
+                            results.loaded.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("No dev WASM tools found: {}", e);
+                }
+            }
+        }
+    };
+
+    let mcp_servers_future = async {
+        if let Some(ref secrets) = secrets_store {
+            let servers_result = if let Some(ref d) = db {
+                load_mcp_servers_from_db(d.as_ref(), "default").await
+            } else {
+                ironclaw::tools::mcp::config::load_mcp_servers().await
+            };
+            match servers_result {
+                Ok(servers) => {
+                    let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
+                    if !enabled.is_empty() {
+                        tracing::info!("Loading {} configured MCP server(s)...", enabled.len());
+                    }
+
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for server in enabled {
+                        let mcp_sm = Arc::clone(&mcp_session_manager);
+                        let secrets = Arc::clone(secrets);
+                        let tools = Arc::clone(&tools);
+
+                        join_set.spawn(async move {
+                            let server_name = server.name.clone();
+                            tracing::debug!(
+                                "Checking authentication for MCP server '{}'...",
+                                server_name
+                            );
+                            let has_tokens = is_authenticated(&server, &secrets, "default").await;
+                            tracing::debug!(
+                                "MCP server '{}' has_tokens={}",
+                                server_name,
+                                has_tokens
+                            );
+
+                            let client = if has_tokens || server.requires_auth() {
+                                McpClient::new_authenticated(server, mcp_sm, secrets, "default")
+                            } else {
+                                McpClient::new_with_name(&server_name, &server.url)
+                            };
+
+                            tracing::debug!("Fetching tools from MCP server '{}'...", server_name);
+                            match client.list_tools().await {
+                                Ok(mcp_tools) => {
+                                    let tool_count = mcp_tools.len();
+                                    tracing::debug!(
+                                        "Got {} tools from MCP server '{}'",
+                                        tool_count,
+                                        server_name
+                                    );
+                                    match client.create_tools().await {
+                                        Ok(tool_impls) => {
+                                            for tool in tool_impls {
+                                                tools.register(tool).await;
+                                            }
+                                            tracing::info!(
+                                                "Loaded {} tools from MCP server '{}'",
+                                                tool_count,
+                                                server_name
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to create tools from MCP server '{}': {}",
+                                                server_name,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let err_str = e.to_string();
+                                    if err_str.contains("401") || err_str.contains("authentication")
+                                    {
+                                        tracing::warn!(
+                                            "MCP server '{}' requires authentication. \
+                                             Run: ironclaw mcp auth {}",
+                                            server_name,
+                                            server_name
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "Failed to connect to MCP server '{}': {}",
+                                            server_name,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    while let Some(result) = join_set.join_next().await {
+                        if let Err(e) = result {
+                            tracing::warn!("MCP server loading task panicked: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("No MCP servers configured ({})", e);
+                }
+            }
+        }
+    };
+
+    tokio::join!(wasm_tools_future, mcp_servers_future);
+
+    // Create extension manager for in-chat discovery/install/auth/activate
+    let extension_manager = if let Some(ref secrets) = secrets_store {
+        let manager = Arc::new(ExtensionManager::new(
+            Arc::clone(&mcp_session_manager),
+            Arc::clone(secrets),
+            Arc::clone(&tools),
+            wasm_tool_runtime.clone(),
+            config.wasm.tools_dir.clone(),
+            config.channels.wasm_channels_dir.clone(),
+            config.tunnel.public_url.clone(),
+            "default".to_string(),
+            db.clone(),
+        ));
+        tools.register_extension_tools(Arc::clone(&manager));
+        tracing::info!("Extension manager initialized with in-chat discovery tools");
+        Some(manager)
+    } else {
+        tracing::debug!(
+            "Extension manager not available (no secrets store). \
+             Extension tools won't be registered."
+        );
+        None
+    };
+
+    // Set up orchestrator for sandboxed job execution
+    // When allow_local_tools is false (default), the LLM uses create_job for FS/shell work.
+    // When allow_local_tools is true, dev tools are also registered directly (current behavior).
+    if config.agent.allow_local_tools {
+        tools.register_dev_tools();
+        tracing::info!(
+            "Local tools enabled (allow_local_tools=true), dev tools registered directly"
+        );
+    }
+
+    // Shared state for job events (used by both orchestrator and web gateway)
     let job_event_tx: Option<
         tokio::sync::broadcast::Sender<(uuid::Uuid, ironclaw::channels::web::types::SseEvent)>,
     > = if config.sandbox.enabled {

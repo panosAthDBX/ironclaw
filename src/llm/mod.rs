@@ -11,6 +11,7 @@ pub mod circuit_breaker;
 pub mod costs;
 pub mod failover;
 mod nearai_chat;
+mod openai_compatible_chat;
 mod provider;
 mod reasoning;
 pub mod response_cache;
@@ -21,7 +22,9 @@ pub mod smart_routing;
 
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
 pub use failover::{CooldownConfig, FailoverProvider};
-pub use nearai_chat::{ModelInfo, NearAiChatProvider};
+pub use nearai::{ModelInfo, NearAiProvider};
+pub use nearai_chat::NearAiChatProvider;
+pub use openai_compatible_chat::OpenAiCompatibleChatProvider;
 pub use provider::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ModelMetadata,
     Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition, ToolResult,
@@ -41,7 +44,7 @@ use std::sync::Arc;
 use rig::client::CompletionClient;
 use secrecy::ExposeSecret;
 
-use crate::config::{LlmBackend, LlmConfig, NearAiConfig};
+use crate::config::{LlmBackend, LlmConfig, NearAiApiMode, NearAiConfig, OpenAiCompatibleConfig};
 use crate::error::LlmError;
 
 /// Create an LLM provider based on configuration.
@@ -90,27 +93,27 @@ fn create_openai_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, Ll
         provider: "openai".to_string(),
     })?;
 
-    use rig::providers::openai;
-
-    // Use CompletionsClient (Chat Completions API) instead of the default Client
-    // (Responses API). The Responses API path in rig-core panics when tool results
-    // are sent back because ironclaw doesn't thread `call_id` through its ToolCall
-    // type. The Chat Completions API works correctly with the existing code.
-    let client: openai::CompletionsClient = if let Some(ref base_url) = oai.base_url {
+    // When a base_url override is set (e.g. for proxies), use our native
+    // OpenAI-compatible chat provider which handles tool calls more robustly.
+    if let Some(base_url) = oai.base_url.as_ref() {
         tracing::info!(
-            "Using OpenAI direct API (chat completions, model: {}, base_url: {})",
+            "Using OpenAI direct API via compatible chat provider (model: {}, base_url: {})",
             oai.model,
             base_url,
         );
-        openai::Client::builder()
-            .base_url(base_url)
-            .api_key(oai.api_key.expose_secret())
-            .build()
-    } else {
-        tracing::info!(
-            "Using OpenAI direct API (chat completions, model: {}, base_url: default)",
-            oai.model,
-        );
+
+        let compat = OpenAiCompatibleConfig {
+            base_url: base_url.clone(),
+            api_key: Some(oai.api_key.clone()),
+            model: oai.model.clone(),
+        };
+
+        return Ok(Arc::new(OpenAiCompatibleChatProvider::new(compat)?));
+    }
+
+    use rig::providers::openai;
+
+    let client: openai::CompletionsClient =
         openai::Client::new(oai.api_key.expose_secret())
     }
     .map_err(|e| LlmError::RequestFailed {
@@ -120,6 +123,10 @@ fn create_openai_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, Ll
     .completions_api();
 
     let model = client.completion_model(&oai.model);
+    tracing::info!(
+        "Using OpenAI direct API (chat completions, model: {}, base_url: default)",
+        oai.model,
+    );
     Ok(Arc::new(RigAdapter::new(model, &oai.model)))
 }
 
@@ -218,51 +225,13 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
             provider: "openai_compatible".to_string(),
         })?;
 
-    use rig::providers::openai;
-
-    let mut extra_headers = reqwest::header::HeaderMap::new();
-    for (key, value) in &compat.extra_headers {
-        let name = match reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(header = %key, error = %e, "Skipping LLM_EXTRA_HEADERS entry: invalid header name");
-                continue;
-            }
-        };
-        let val = match reqwest::header::HeaderValue::from_str(value) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(header = %key, error = %e, "Skipping LLM_EXTRA_HEADERS entry: invalid header value");
-                continue;
-            }
-        };
-        extra_headers.insert(name, val);
-    }
-
-    let client: openai::CompletionsClient = openai::Client::builder()
-        .base_url(&compat.base_url)
-        .api_key(
-            compat
-                .api_key
-                .as_ref()
-                .map(|k| k.expose_secret().to_string())
-                .unwrap_or_else(|| "no-key".to_string()),
-        )
-        .http_headers(extra_headers)
-        .build()
-        .map_err(|e| LlmError::RequestFailed {
-            provider: "openai_compatible".to_string(),
-            reason: format!("Failed to create OpenAI-compatible client: {}", e),
-        })?
-        .completions_api();
-
-    let model = client.completion_model(&compat.model);
     tracing::info!(
         "Using OpenAI-compatible endpoint (chat completions, base_url: {}, model: {})",
         compat.base_url,
         compat.model
     );
-    Ok(Arc::new(RigAdapter::new(model, &compat.model)))
+
+    Ok(Arc::new(OpenAiCompatibleChatProvider::new(compat.clone())?))
 }
 
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).
