@@ -21,7 +21,7 @@ The core data (`ToolSelection.reasoning`, `RespondResult::ToolCalls.content`) al
 ## 2. Goals
 
 1. **Store per-turn reasoning data** in the existing in-memory `Session`/`Turn` structures (no DB persistence in v1).
-2. **Thread reasoning from LLM output to `TurnToolCall`**: carry `content` from `RespondResult::ToolCalls` as turn-level narrative; expose raw parameter JSON on `TurnToolCall`.
+2. **Thread per-tool reasoning from LLM output to `TurnToolCall`**: carry `ToolSelection.reasoning` through the provider `ToolCall` shape and persist one rationale per tool decision; keep `RespondResult::ToolCalls.content` as optional turn-level narrative context only.
 3. **CLI**: always show reasoning summary after each turn; add `/reasoning` as a first-class command for querying historical turns.
 4. **HTTP**: add reasoning inline to turn-level API responses, keyed by `(session_id, thread_id, turn_number)`.
 5. **SSE**: emit reasoning events to the web gateway in v1.
@@ -61,8 +61,8 @@ dispatcher.rs::run_agentic_loop()
     │               └─ tool_calls ──► dispatcher loop                       │
     │                                    │                                   │  GAP
     │                                    ▼                                   │
-    │                             turn.record_tool_call(name, params)        │
-    │                             [TurnToolCall: name, params, result, error]│
+    │                             turn.record_tool_call(name, params, rationale, parallel_group)
+    │                             [TurnToolCall: name, params, rationale, parallel_group, result, error]
     │                             ◄──────────────────────────────────────────┘
     │
     ▼
@@ -78,14 +78,15 @@ User message
 dispatcher.rs::run_agentic_loop()
     │
     ├─► Reasoning::respond_with_tools()
-    │       └─► RespondResult::ToolCalls { tool_calls, content: Option<String> }
+    │       └─► RespondResult::ToolCalls { tool_calls: Vec<ToolCall { id, name, arguments, reasoning }>, content: Option<String> }
     │               │
-    │               ├─ content ──► SafetyLayer::sanitize_tool_output() ──► turn.set_narrative(sanitized_content)
+    │               ├─ content (optional turn narrative) ──► SafetyLayer::sanitize_tool_output() ──► turn.set_narrative(sanitized_content)
     │               └─ tool_calls ──► dispatcher loop
     │                                    │
+    │                                    ├─ reasoning (per tool) ──► SafetyLayer::sanitize_tool_output() ──► fallback_if_empty()
     │                                    ▼
-    │                             turn.record_tool_call(name, params)
-    │                             [TurnToolCall: name, params, result, error]
+    │                             turn.record_tool_call(name, params, rationale, parallel_group)
+    │                             [TurnToolCall: name, params, rationale, parallel_group, result, error]
     │                                    │
     │                                    ▼
     │                             SseManager::broadcast(SseEvent::ReasoningUpdate { ... })
@@ -94,18 +95,20 @@ dispatcher.rs::run_agentic_loop()
 thread.complete_turn(response)
     │
     ▼
-CLI: print reasoning block (always-on)
-HTTP: reasoning inline in TurnInfo response
-SSE: already emitted during execution
+CLI: print reasoning block with per-tool why (always-on)
+HTTP: reasoning inline in TurnInfo response (per-tool rationale required)
+SSE: reasoning_update includes per-tool rationale per decision
 ```
 
 ### 4.3 Worker Path (worker/runtime.rs)
 
-The worker's `execution_loop` uses `reasoning.respond_with_tools()` in the same pattern. After `RespondResult::ToolCalls { content, .. }`, the `content` field is currently forwarded to `post_event("message", ...)` but not stored as structured reasoning. The worker does not have a `Session`/`Turn` structure; it has its own `ConversationMemory` / `JobAction` log in `context/memory.rs`.
+The worker's `execution_loop` uses `reasoning.respond_with_tools()` in the same pattern. The worker does not have a `Session`/`Turn` structure; it has its own `ConversationMemory` / `JobAction` log in `context/memory.rs`.
 
 For the worker path, the spec targets:
-- `content` from `RespondResult::ToolCalls` is sanitized and emitted as a job reasoning event (`JobReasoning` event type) via `post_event`.
-- No `TurnToolCall` extension is needed in the worker — reasoning is attached to the `JobEventPayload` stream.
+- Thread per-tool rationale into worker `tool_calls` (same `ToolCall.reasoning` shape as chat path).
+- Sanitize each per-tool rationale and emit it in a structured job reasoning event via `post_event`.
+- Keep `content` as optional turn-level narrative context for the job event.
+- No `TurnToolCall` extension is needed in the worker — reasoning remains attached to the worker `JobEventPayload` stream.
 
 ---
 
@@ -113,7 +116,8 @@ For the worker path, the spec targets:
 
 ### 5.1 `TurnToolCall` Extension (`src/agent/session.rs`)
 
-Add an optional `rationale` field to carry the model's reasoning (from `ToolSelection.reasoning` if individually available, or from the turn-level `content` field of `RespondResult::ToolCalls`).
+Add a `rationale` field to carry the model's per-tool reasoning from `ToolSelection.reasoning` (threaded through `ToolCall`).
+`RespondResult::ToolCalls.content` remains optional turn-level narrative context and must not be used as a replacement for per-tool rationale.
 
 **Current:**
 ```rust
@@ -132,11 +136,11 @@ pub struct TurnToolCall {
     pub parameters: serde_json::Value,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
-    /// LLM-supplied rationale for this tool selection.
-    /// Extracted from turn-level content when per-call reasoning is unavailable.
-    /// Sanitized through SafetyLayer before storage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rationale: Option<String>,
+    /// LLM-supplied per-tool rationale from ToolSelection.reasoning,
+    /// sanitized through SafetyLayer before storage.
+    /// Required for every tool decision; if upstream rationale is missing
+    /// after sanitization, store deterministic fallback text.
+    pub rationale: String,
     /// Parallel batch group index (0-based). Tools sharing the same index
     /// were dispatched concurrently in Phase 2 of the dispatcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,7 +154,7 @@ pub fn record_tool_call(
     &mut self,
     name: impl Into<String>,
     params: serde_json::Value,
-    rationale: Option<String>,  // NEW
+    rationale: String,  // NEW (required)
     parallel_group: Option<usize>,  // NEW
 )
 ```
@@ -216,9 +220,15 @@ Sanitized text → stored in Turn.narrative / TurnToolCall.rationale
 
 ### 6.2 Sanitization Point
 
-The sanitization is performed **once**, at write time, in the dispatcher immediately after receiving `RespondResult::ToolCalls.content`. The stored value is already sanitized; no additional sanitization is needed at read time (HTTP response, CLI output, SSE emission).
+Sanitization is performed **at write time** for every reasoning field:
+- once for optional turn narrative from `RespondResult::ToolCalls.content`;
+- once per tool for rationale from `ToolCall.reasoning`.
+Stored values are already sanitized; no additional sanitization is needed at read time (HTTP response, CLI output, SSE emission).
 
-If `SafetyLayer::sanitize_tool_output` returns blocked/truncated sentinel content, `Turn.narrative` is set to `None` and a `tracing::warn!` is emitted. The turn continues normally — reasoning omission must never block the agent loop.
+If `SafetyLayer::sanitize_tool_output` returns blocked/truncated sentinel content:
+- for `Turn.narrative`, set `Turn.narrative = None` and continue;
+- for per-tool rationale, store deterministic fallback text (e.g. `"Tool selected to satisfy the current subtask."`) and continue.
+In both cases emit `tracing::warn!`; reasoning capture issues must never block the agent loop.
 
 ### 6.3 No Raw CoT Exposure
 
@@ -261,10 +271,10 @@ The latest updates include: [response text]
 **Formatting rules:**
 - Reasoning block is separated from the response by a blank line and a dim `┄` prefix.
 - Each tool call entry: `  ┄ <tool_name>  "<rationale>"`
-- Parameters: `    params: { ... }` (raw JSON, truncated to 200 chars if long)
+- Parameters: `    params: { ... }` (sensitive values redacted, output truncated to 200 chars if long)
 - Result: `    → <outcome>` (success / error / N bytes / N items)
 - Parallel batches: prefixed with `  ┄ [parallel] ` on the first entry; subsequent tools in the same batch are indented identically with `  ┄   ↳ <tool_name>`.
-- If no narrative or rationale is available, the block is omitted entirely (no output).
+- The block is shown whenever tool calls occurred. If turn narrative is missing, omit only the `Narrative:` line; tool rows must still show per-tool rationale.
 - Colors follow existing REPL scheme: dim gray for the section, cyan for tool names.
 
 ### 7.2 `/reasoning` Command
@@ -359,8 +369,7 @@ All reasoning objects are keyed by `(session_id, thread_id, turn_number)` (requi
 #[derive(Debug, Serialize)]
 pub struct ToolDecisionInfo {
     pub tool_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rationale: Option<String>,
+    pub rationale: String,
     pub parameters: serde_json::Value,
     pub outcome: String,  // "success" | "error" | "rejected"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,7 +406,7 @@ Content-Type: application/json
   "thread_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
   "turns": [
     {
-      "turn_number": 0,
+      "turn_number": 1,
       "user_input": "search for recent project updates",
       "response": "The latest updates include...",
       "state": "completed",
@@ -410,7 +419,7 @@ Content-Type: application/json
       "reasoning": {
         "session_id": "550e8400-e29b-41d4-a716-446655440000",
         "thread_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-        "turn_number": 0,
+        "turn_number": 1,
         "narrative": "I'll search memory first, then check git log for recent changes.",
         "tool_decisions": [
           {
@@ -443,14 +452,14 @@ When tools are dispatched in parallel (Phase 2 of the dispatcher), `parallel_gro
 "tool_decisions": [
   {
     "tool_name": "memory_search",
-    "rationale": null,
+    "rationale": "Searched memory for relevant authentication context.",
     "parameters": { "query": "auth design" },
     "outcome": "success",
     "parallel_group": 0
   },
   {
     "tool_name": "file_read",
-    "rationale": null,
+    "rationale": "Read the sanitizer source to verify current behavior.",
     "parameters": { "path": "src/safety/sanitizer.rs" },
     "outcome": "success",
     "parallel_group": 0
@@ -489,15 +498,14 @@ pub enum SseEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDecisionSsePayload {
     pub tool_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rationale: Option<String>,
+    pub rationale: String,
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_group: Option<usize>,
 }
 ```
 
-**Note:** SSE payloads omit `parameters` to avoid large JSON blobs over the event stream. Parameters are available on the HTTP history endpoint.
+**Note:** SSE payloads omit `parameters` to avoid large JSON blobs over the event stream. Parameters are available on the HTTP history endpoint with sensitive values redacted.
 
 ### 9.2 Emission Timing
 
@@ -534,7 +542,7 @@ The worker path does not have `SseManager` access directly; it uses `post_event(
 }
 ```
 
-The orchestrator's SSE bridge currently maps unknown worker event types to `SseEvent::JobStatus`; adding a dedicated `job_reasoning` event requires extending orchestrator event mapping and frontend listeners.
+The orchestrator now maps worker `"reasoning"` events to a dedicated `SseEvent::JobReasoning`, and the web frontend listens to `job_reasoning` for activity-stream updates.
 
 ---
 
@@ -572,36 +580,31 @@ The `batch_counter` increments each time Phase 2 runs with `>1` concurrent tools
 
 ### 11.1 Chat Path (`src/agent/dispatcher.rs::run_agentic_loop`)
 
-**Change 1 — Capture narrative:**  
-After receiving `RespondResult::ToolCalls { tool_calls, content }`, before recording tool calls:
+**Change 1 — Capture optional turn narrative:**  
+After receiving `RespondResult::ToolCalls { tool_calls, content }`, sanitize and store `content` into `Turn.narrative` when present.
 
-```
-if let Some(ref text) = content {
-    let sanitized = safety.process(text);
-    if let Some(safe_text) = sanitized {
-        session.lock() → thread.last_turn_mut() → turn.set_narrative(safe_text);
-    }
-    // Emit SSE narrative partial immediately
-    sse_manager.broadcast(SseEvent::ReasoningUpdate { narrative: Some(safe_text), tool_decisions: vec![], ... });
-}
-```
+**Change 2 — Thread per-tool rationale:**  
+Extend provider-level `ToolCall` to include `reasoning: String` and thread `ToolSelection.reasoning` into that field inside `Reasoning::respond_with_tools()`, applying deterministic fallback if the upstream value is empty.
 
-**Change 2 — Assign parallel groups:**  
+**Change 3 — Assign parallel groups:**  
 Before Phase 2, compute `parallel_group` for the current `runnable` slice:
 - `if runnable.len() <= 1: None`
 - `else: Some(batch_counter); batch_counter += 1;`
 
-Pass `parallel_group` through to `record_tool_call()`.
+**Change 4 — Record required rationale on `TurnToolCall`:**  
+`record_tool_call` takes required `rationale: String`.
+For each tool call, sanitize `tool_call.reasoning`; if missing/blocked after sanitization, store deterministic fallback rationale text. Then persist via `record_tool_call(name, params, rationale, parallel_group)`.
 
-**Change 3 — Record rationale on `TurnToolCall`:**  
-`record_tool_call` gains `rationale: Option<String>` parameter. In the single-tool path, rationale comes from the narrative (shared). In the parallel path, rationale is `None` per-call (narrative is at turn level only, per requirement #11).
-
-**Change 4 — Emit `ReasoningUpdate` SSE after Phase 3:**  
+**Change 5 — Emit `ReasoningUpdate` SSE after Phase 3:**  
 After all post-flight results are recorded, collect the current turn's `tool_decisions` from `TurnToolCall` entries and broadcast `SseEvent::ReasoningUpdate`.
 
 ### 11.2 Worker Path (`src/worker/runtime.rs::execution_loop`)
 
-After `RespondResult::ToolCalls { content, tool_calls }`, extract and sanitize `content`, then call `post_event("reasoning", { narrative, tool_decisions })` with the collected tool names and outcomes. The existing `tool_use` and `tool_result` events continue unchanged.
+After `RespondResult::ToolCalls { content, tool_calls }`:
+- sanitize optional `content` into `narrative`;
+- for each tool call, sanitize `tool_call.reasoning` and apply deterministic fallback rationale if missing/blocked;
+- call `post_event("reasoning", { narrative, tool_decisions })` with tool name, rationale, and outcome.
+The existing `tool_use` and `tool_result` events continue unchanged.
 
 ---
 
@@ -612,7 +615,7 @@ After `RespondResult::ToolCalls { content, tool_calls }`, extract and sanitize `
 - Reasoning data lives in `TurnToolCall.rationale`, `TurnToolCall.parallel_group`, and `Turn.narrative` — all part of the existing `Session` heap allocation.
 - Sessions live in `Arc<Mutex<Session>>` inside `SessionManager`. They are dropped when the session is evicted or the process restarts.
 - No separate data structure or cache is allocated for reasoning.
-- Memory growth: each turn adds at most one `Option<String>` narrative and one `Option<String>` rationale per tool call. For a long session with 200 turns × 5 tool calls each × 500 bytes average rationale = ~500 KB worst-case; acceptable.
+- Memory growth: each turn adds at most one optional narrative and one required rationale string per tool call. For a long session with 200 turns × 5 tool calls each × 500 bytes average rationale = ~500 KB worst-case; acceptable.
 - No configurable TTL, rolling window, or per-turn eviction in v1.
 
 ---
@@ -621,9 +624,9 @@ After `RespondResult::ToolCalls { content, tool_calls }`, extract and sanitize `
 
 | Path | Where | Change |
 |------|-------|--------|
-| Chat dispatcher | `src/agent/dispatcher.rs` | Thread `content` through to `Turn.narrative`; pass `parallel_group` + `rationale` to `record_tool_call`; emit `ReasoningUpdate` SSE |
-| Worker runtime | `src/worker/runtime.rs` | Sanitize `content` from `RespondResult::ToolCalls`; emit `"reasoning"` job event via `post_event` |
-| Session model | `src/agent/session.rs` | Add `narrative` to `Turn`; add `rationale` + `parallel_group` to `TurnToolCall`; update `record_tool_call` signature |
+| Chat dispatcher | `src/agent/dispatcher.rs` | Thread `content` to optional `Turn.narrative`; thread per-tool `ToolCall.reasoning`, sanitize+fallback, pass required `rationale` + `parallel_group` to `record_tool_call`; emit `ReasoningUpdate` SSE |
+| Worker runtime | `src/worker/runtime.rs` | Sanitize optional `content`; sanitize+fallback per-tool rationale from `ToolCall.reasoning`; emit `"reasoning"` job event via `post_event` |
+| Session model | `src/agent/session.rs` | Add `narrative` to `Turn`; make `rationale` required on `TurnToolCall`; keep `parallel_group`; update `record_tool_call` signature |
 | REPL channel | `src/channels/repl.rs` | Always-on reasoning block after each turn; `/reasoning [N|all]` command |
 | Web types | `src/channels/web/types.rs` | Add `TurnReasoningInfo`, `ToolDecisionInfo`, `ToolDecisionSsePayload`; extend `TurnInfo`; add `SseEvent::ReasoningUpdate` |
 | Web server | `src/channels/web/server.rs` | Populate `reasoning` field when building `TurnInfo` from `Turn` |
@@ -632,6 +635,8 @@ After `RespondResult::ToolCalls { content, tool_calls }`, extract and sanitize `
 ---
 
 ## 14. API Examples
+
+All examples below use user-facing 1-based `turn_number` values.
 
 ### 14.1 History with Reasoning — Single Tool Turn
 
@@ -644,7 +649,7 @@ GET /api/chat/history?thread_id={thread_id}
   "thread_id": "7c9e6679...",
   "turns": [
     {
-      "turn_number": 0,
+      "turn_number": 1,
       "user_input": "what time is it?",
       "response": "It's 10:35 AM UTC.",
       "state": "completed",
@@ -656,7 +661,7 @@ GET /api/chat/history?thread_id={thread_id}
       "reasoning": {
         "session_id": "550e8400...",
         "thread_id": "7c9e6679...",
-        "turn_number": 0,
+        "turn_number": 1,
         "narrative": "The user wants the current time. I'll call the time tool.",
         "tool_decisions": [
           {
@@ -720,39 +725,42 @@ data: {"type":"reasoning_update","thread_id":"7c9e...","session_id":"550e...","t
 
 ### 15.1 Implementation Order
 
-1. **Data model** (`session.rs`): Add `narrative` to `Turn`, add `rationale` + `parallel_group` to `TurnToolCall`, update `record_tool_call` signature. Update all callers.
-2. **Dispatcher** (`dispatcher.rs`): Thread `content` → sanitize → `turn.set_narrative`. Assign `parallel_group`. Pass `rationale` and `parallel_group` to `record_tool_call`. Emit `ReasoningUpdate` SSE after Phase 3.
-3. **Worker** (`worker/runtime.rs`): Sanitize `content`, emit `"reasoning"` job event.
-4. **HTTP types + server** (`web/types.rs`, `web/server.rs`): Add DTOs, populate `reasoning` field in `TurnInfo` construction.
-5. **SSE variant** (`web/types.rs`): Add `ReasoningUpdate` and `ToolDecisionSsePayload`.
-6. **REPL** (`repl.rs`): Always-on display after turn completion; `/reasoning` command parsing and dispatch.
-7. **Tests**: Unit tests per step (see §15.2).
-8. **Standards checks**: Run `cargo fmt`, `cargo clippy --all --benches --tests --examples --all-features`, `cargo test`, `cargo check --no-default-features --features libsql`, `cargo check --all-features`.
-9. **Feature parity**: Update `FEATURE_PARITY.md` — add `Agent Reasoning Summary` row with `✅` status.
+1. **Provider model threading** (`src/llm/provider.rs`, `src/llm/reasoning.rs`): add `reasoning: String` to `ToolCall` and thread `ToolSelection.reasoning` into each emitted tool call with deterministic fallback for empty values.
+2. **Data model** (`session.rs`): add `narrative` to `Turn`, make `rationale` required + `parallel_group` on `TurnToolCall`, update `record_tool_call` signature. Update all callers.
+3. **Dispatcher** (`dispatcher.rs`): sanitize/store optional `content` into `turn.set_narrative`; sanitize/fallback per-tool rationale from `tool_call.reasoning`; assign `parallel_group`; persist required rationale; emit `ReasoningUpdate` SSE after Phase 3.
+4. **Worker** (`worker/runtime.rs`): sanitize optional `content`; sanitize/fallback per-tool rationale; emit `"reasoning"` job event.
+5. **HTTP types + server** (`web/types.rs`, `web/server.rs`): make rationale required in DTOs; populate `reasoning` field in `TurnInfo` construction.
+6. **SSE variant** (`web/types.rs`): ensure `ToolDecisionSsePayload.rationale` is required.
+7. **REPL** (`repl.rs`): always-on display after turn completion; `/reasoning` command parsing and dispatch.
+8. **Tests**: unit tests per step (see §15.2).
+9. **Standards checks**: run `cargo fmt`, `cargo clippy --all --benches --tests --examples --all-features`, `cargo test`, `cargo check --no-default-features --features libsql`, `cargo check --all-features`.
+10. **Feature parity**: update `FEATURE_PARITY.md` — add `Agent Reasoning Summary` row with `✅` status.
 
 ### 15.2 Test Plan
 
 | Test | Location | What to verify |
 |------|----------|----------------|
 | `test_turn_narrative_set_and_get` | `session.rs::tests` | `Turn.set_narrative()` stores and `Turn.narrative` returns the value |
-| `test_record_tool_call_with_rationale` | `session.rs::tests` | `record_tool_call` captures `rationale` and `parallel_group` |
-| `test_reasoning_safety_block` | `dispatcher::tests` (new) | If `SafetyLayer` blocks content, `Turn.narrative` is `None` and turn continues |
-| `test_reasoning_safety_redact` | `dispatcher::tests` (new) | If `SafetyLayer` redacts a secret, `Turn.narrative` contains `[REDACTED]` placeholder and not the raw secret |
+| `test_record_tool_call_with_rationale` | `session.rs::tests` | `record_tool_call` captures required `rationale` and `parallel_group` |
+| `test_toolcall_reasoning_threaded_from_selection` | `llm/reasoning.rs::tests` (new) | `ToolSelection.reasoning` is propagated into emitted `ToolCall.reasoning` |
+| `test_reasoning_safety_block_narrative` | `dispatcher::tests` (new) | If safety blocks `content`, `Turn.narrative` is `None` and turn continues |
+| `test_reasoning_safety_block_rationale_fallback` | `dispatcher::tests` (new) | If safety blocks per-tool rationale, fallback rationale string is stored |
+| `test_reasoning_safety_redact_rationale` | `dispatcher::tests` (new) | If safety redacts per-tool rationale, stored rationale is redacted and non-empty |
 | `test_parallel_group_assigned` | `dispatcher::tests` (new) | Multi-tool iteration sets non-null `parallel_group` on all runnable tools |
 | `test_single_tool_no_parallel_group` | `dispatcher::tests` (new) | Single tool iteration sets `parallel_group = None` |
-| `test_turn_info_reasoning_serialization` | `web/types.rs::tests` (new) | `TurnReasoningInfo` serializes correctly; `null` when no tool calls |
+| `test_turn_info_reasoning_serialization` | `web/types.rs::tests` (new) | `TurnReasoningInfo` serializes correctly with required `rationale` per tool decision |
 | `test_repl_reasoning_command_routing` | `repl.rs::tests` (new) | `/reasoning 3` produces an `IncomingMessage` with content `/reasoning 3` |
 
 ### 15.3 Verification Checklist
 
 - [ ] `Turn.narrative` is `None` for turns without tool calls.
 - [ ] `Turn.narrative` is `None` when `content` is `None` in `RespondResult::ToolCalls`.
-- [ ] `TurnToolCall.rationale` is `None` for parallel-batch tools (narrative is at turn level).
+- [ ] Every `TurnToolCall` stores non-empty `rationale` (real or deterministic fallback), including parallel batches.
 - [ ] `TurnToolCall.parallel_group` is `None` for single-tool iterations.
-- [ ] Sanitized content never contains raw API keys, tokens, or private keys.
-- [ ] `SseEvent::ReasoningUpdate` is serialized with `"type": "reasoning_update"`.
+- [ ] Sanitized reasoning never contains raw API keys, tokens, or private keys.
+- [ ] `SseEvent::ReasoningUpdate` is serialized with `"type": "reasoning_update"` and per-tool `rationale` present.
 - [ ] HTTP `reasoning` field is absent (`null`/omitted) for turns with no tool calls.
-- [ ] CLI reasoning block is absent for turns with no tool calls.
+- [ ] CLI reasoning block is present for turns with tool calls and shows per-tool rationale.
 - [ ] `/reasoning N` for out-of-range N prints a clear error, does not panic.
 - [ ] `cargo check` passes for default, libsql-only, and all-features builds.
 - [ ] No `.unwrap()` or `.expect()` added in production paths.
@@ -766,7 +774,7 @@ data: {"type":"reasoning_update","thread_id":"7c9e...","session_id":"550e...","t
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
-| `content` field is `None` for many model responses | Medium | Both `Turn.narrative` and `TurnToolCall.rationale` are `Option<String>`; absent is valid and silently omitted |
+| `content` field is `None` for many model responses | Medium | `Turn.narrative` is optional by design; per-tool rationale still remains present via `ToolCall.reasoning` or deterministic fallback |
 | Reasoning text echoes sensitive user context | Medium | Full `SafetyLayer` pipeline with `LeakDetector` covers API keys, tokens, connection strings; Block action drops the field |
 | Safety pipeline mangling useful phrasing | Low | `Sanitize` action (escape, not delete) preserves most text; only `Block` drops the field entirely |
 | Memory growth for very long sessions | Low | ~500 KB worst-case for 200-turn session (see §12) |
@@ -774,13 +782,13 @@ data: {"type":"reasoning_update","thread_id":"7c9e...","session_id":"550e...","t
 
 ### 16.2 Tradeoffs
 
-**Turn-level narrative vs. per-tool-call rationale:**  
-The `ToolSelection.reasoning` field is produced per-call during planning but is not forwarded through `RespondResult::ToolCalls` (only `id/name/arguments` travel). Forwarding per-call rationale would require adding `reasoning: Option<String>` to `ToolCall` in `src/llm/provider.rs` and plumbing it through every provider. This is a larger blast radius.
+**Per-tool rationale (chosen) vs. turn-level-only narrative:**  
+Per-tool rationale is now required because the product intent is to show *why each tool was selected*, not just which tools ran. This requires extending provider-level `ToolCall` with `reasoning` and plumbing that field through the chat and worker paths. Blast radius is larger than turn-level-only narrative, but behavior matches user intent.
 
-The chosen approach stores the turn-level `content` field from `RespondResult::ToolCalls` as the narrative. This covers the majority of useful content (the model's pre-tool explanatory text) with minimal structural change. Per-tool rationale is preserved as `Option<String>` on `TurnToolCall` for future population when the per-call path is implemented.
+Turn-level `content` remains useful context, but is explicitly optional and not a substitute for per-tool rationale.
 
 **No extra LLM call:**  
-Deterministic narrative only (requirement #2). This trades narrative richness for zero added latency and zero extra cost. A 2–4 sentence LLM-generated summary would be higher quality but would add 300–800 ms per turn and ~200 tokens per turn in cost.
+Per-tool rationale still comes from existing deterministic model output (`ToolSelection.reasoning`) with deterministic fallback text when missing/blocked after sanitization. This preserves zero added model latency and zero added token cost.
 
 **Alternatives field omitted:**  
 `ToolSelection.alternatives` is always empty in practice (LLM does not reliably populate it). Including it in the payload would add noise with no signal. Deferred to a future iteration when prompt engineering can reliably elicit alternatives.
@@ -802,7 +810,7 @@ The worker does not have a `Session`/`Turn` structure. Extending the worker to w
 |----------|-----------|
 | `adding-features.md` | Feature uses existing trait boundaries (`SafetyLayer`, `Turn`, `SseEvent`); no new crates; minimal blast radius |
 | `code-style.md` | `crate::` imports; strong types (`TurnReasoningInfo`, `ToolDecisionInfo`); no `pub use` re-exports |
-| `error-handling.md` | `SafetyLayer` errors map to `None` (with warn log), not panics; no `.unwrap()` in production paths |
+| `error-handling.md` | `SafetyLayer` handling never panics: narrative may map to `None`; per-tool rationale uses deterministic fallback with warn logs; no `.unwrap()` in production paths |
 | `async-patterns.md` | Existing `Arc<Mutex<Session>>` pattern; lock scope kept minimal (take + release before SSE emit) |
 | `security.md` | Full `SafetyLayer` pipeline on all reasoning text; no raw credentials in logs or responses |
 | `database.md` | No DB persistence in v1; dual-backend rule is not triggered |

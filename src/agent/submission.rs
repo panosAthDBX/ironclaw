@@ -40,6 +40,10 @@ impl SubmissionParser {
         if lower == "/suggest" {
             return Submission::Suggest;
         }
+        if lower == "/reasoning" || lower == "/reasoning all" || lower.starts_with("/reasoning ") {
+            let arg = trimmed.split_whitespace().nth(1).map(|s| s.to_string());
+            return Submission::Reasoning { arg };
+        }
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
@@ -212,6 +216,12 @@ pub enum Submission {
     /// Suggest next steps based on the current thread.
     Suggest,
 
+    /// Show stored reasoning summary for the thread.
+    Reasoning {
+        /// Optional argument: turn number or "all".
+        arg: Option<String>,
+    },
+
     /// Quit the agent. Bypasses thread-state checks.
     Quit,
 
@@ -296,6 +306,7 @@ impl Submission {
                 | Self::Heartbeat
                 | Self::Summarize
                 | Self::Suggest
+                | Self::Reasoning { .. }
                 | Self::SystemCommand { .. }
         )
     }
@@ -470,6 +481,28 @@ mod tests {
     fn test_parser_suggest() {
         let submission = SubmissionParser::parse("/suggest");
         assert!(matches!(submission, Submission::Suggest));
+    }
+
+    #[test]
+    fn test_parser_reasoning() {
+        let submission = SubmissionParser::parse("/reasoning");
+        assert!(matches!(submission, Submission::Reasoning { arg: None }));
+
+        let submission = SubmissionParser::parse("/reasoning all");
+        assert!(matches!(
+            submission,
+            Submission::Reasoning {
+                arg: Some(ref arg)
+            } if arg == "all"
+        ));
+
+        let submission = SubmissionParser::parse("/reasoning 3");
+        assert!(matches!(
+            submission,
+            Submission::Reasoning {
+                arg: Some(ref arg)
+            } if arg == "3"
+        ));
     }
 
     #[test]

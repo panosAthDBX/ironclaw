@@ -2,9 +2,10 @@
 
 ## Finalized decisions from shaping
 
-1. **Rationale source**: both
-   - Keep deterministic rationale from existing model output (`RespondResult::ToolCalls.content`) as the baseline.
-   - Also support deterministic post-tool narrative synthesis per turn (no extra LLM call).
+1. **Rationale source**: per-tool, mandatory
+   - Thread deterministic per-tool rationale from `ToolSelection.reasoning` through to each recorded tool call.
+   - Keep `RespondResult::ToolCalls.content` as optional turn-level narrative only (not a substitute for per-tool rationale).
+   - No extra LLM call.
 
 2. **Narrative generation**: deterministic only
    - Do not add extra LLM call for summary generation.
@@ -15,8 +16,8 @@
 4. **HTTP shape**: inline on turn response
    - Add reasoning payload inline to turn responses, keyed by session/thread/turn.
 
-5. **Tool parameters**: raw JSON
-   - Expose raw parameter JSON with tool decision entries.
+5. **Tool parameters**: redacted JSON
+   - Expose parameter JSON with sensitive values redacted in tool decision entries.
 
 6. **Safety boundary**: full SafetyLayer
    - Apply full sanitization/leak/policy pipeline to reasoning text.
@@ -33,9 +34,10 @@
 10. **CLI command**: first-class
     - Add dedicated `/reasoning` command in addition to always-on output.
 
-11. **Reasoning data threading**: turn-level narrative path
-    - Follow current architecture and market best practice: preserve turn-level narrative from `RespondResult::ToolCalls.content`.
-    - Do not duplicate identical reasoning text across each tool call by default.
+11. **Reasoning data threading**: per-tool rationale path
+    - Thread `ToolSelection.reasoning` through `RespondResult::ToolCalls` and into each recorded tool decision.
+    - Require one rationale per tool decision (with deterministic fallback text if upstream reasoning is missing after sanitization).
+    - Keep `RespondResult::ToolCalls.content` as optional turn-level context only.
 
 12. **Alternatives field**: omit for v1
     - `ToolSelection.alternatives` currently low-signal/empty; defer until reliable.

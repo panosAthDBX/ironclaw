@@ -15,10 +15,12 @@ use crate::config::SafetyConfig;
 use crate::context::JobContext;
 use crate::error::WorkerError;
 use crate::llm::{
-    ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
+    ChatMessage, DEFAULT_TOOL_RATIONALE, LlmProvider, Reasoning, ReasoningContext, RespondResult,
+    ToolSelection, normalize_tool_reasoning,
 };
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
+use crate::tools::redaction::redact_sensitive_json;
 use crate::worker::api::{CompletionReport, JobEventPayload, StatusUpdate, WorkerHttpClient};
 use crate::worker::proxy_llm::ProxyLlmProvider;
 
@@ -161,6 +163,7 @@ Work independently to complete this job. Report when done."#,
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        "status": "completed",
                         "success": true,
                         "message": truncate(&output, 2000),
                     }),
@@ -179,6 +182,7 @@ Work independently to complete this job. Report when done."#,
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        "status": "failed",
                         "success": false,
                         "message": format!("Execution failed: {}", e),
                     }),
@@ -197,6 +201,7 @@ Work independently to complete this job. Report when done."#,
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        "status": "failed",
                         "success": false,
                         "message": "Execution timed out",
                     }),
@@ -285,7 +290,14 @@ Work independently to complete this job. Report when done."#,
                         tool_calls,
                         content,
                     } => {
-                        if let Some(ref text) = content {
+                        let reasoning_narrative = sanitize_worker_narrative(&self.safety, &content);
+                        if content.is_some() && reasoning_narrative.is_none() {
+                            tracing::warn!(
+                                "Worker reasoning narrative was empty or blocked by safety policy"
+                            );
+                        }
+
+                        if let Some(text) = reasoning_narrative.as_deref() {
                             self.post_event(
                                 "message",
                                 serde_json::json!({
@@ -304,12 +316,37 @@ Work independently to complete this job. Report when done."#,
                                 tool_calls.clone(),
                             ));
 
+                        let tool_decisions: Vec<serde_json::Value> = tool_calls
+                            .iter()
+                            .map(|tc| {
+                                serde_json::json!({
+                                    "tool_name": tc.name,
+                                    "rationale": sanitize_worker_rationale(&self.safety, &tc.reasoning),
+                                    "outcome": "pending",
+                                    "parallel_group": if tool_calls.len() > 1 {
+                                        serde_json::json!(0)
+                                    } else {
+                                        serde_json::Value::Null
+                                    },
+                                })
+                            })
+                            .collect();
+
+                        self.post_event(
+                            "reasoning",
+                            serde_json::json!({
+                                "narrative": reasoning_narrative,
+                                "tool_decisions": tool_decisions,
+                            }),
+                        )
+                        .await;
+
                         for tc in tool_calls {
                             self.post_event(
                                 "tool_use",
                                 serde_json::json!({
                                     "tool_name": tc.name,
-                                    "input": truncate(&tc.arguments.to_string(), 500),
+                                    "input": redact_sensitive_json(&tc.arguments),
                                 }),
                             )
                             .await;
@@ -321,7 +358,11 @@ Work independently to complete this job. Report when done."#,
                                 serde_json::json!({
                                     "tool_name": tc.name,
                                     "output": match &result {
-                                        Ok(output) => truncate(output, 2000),
+                                        Ok(output) => {
+                                            self.safety
+                                                .sanitize_tool_output("job_tool_result", output)
+                                                .content
+                                        }
                                         Err(e) => format!("Error: {}", truncate(e, 500)),
                                     },
                                     "success": result.is_ok(),
@@ -335,7 +376,7 @@ Work independently to complete this job. Report when done."#,
                             let selection = ToolSelection {
                                 tool_name: tc.name.clone(),
                                 parameters: tc.arguments.clone(),
-                                reasoning: String::new(),
+                                reasoning: sanitize_worker_rationale(&self.safety, &tc.reasoning),
                                 alternatives: vec![],
                                 tool_call_id: tc.id.clone(),
                             };
@@ -344,13 +385,38 @@ Work independently to complete this job. Report when done."#,
                     }
                 }
             } else {
+                let tool_decisions: Vec<serde_json::Value> = selections
+                    .iter()
+                    .map(|selection| {
+                        serde_json::json!({
+                            "tool_name": selection.tool_name,
+                            "rationale": sanitize_worker_rationale(&self.safety, &selection.reasoning),
+                            "outcome": "pending",
+                            "parallel_group": if selections.len() > 1 {
+                                serde_json::json!(0)
+                            } else {
+                                serde_json::Value::Null
+                            },
+                        })
+                    })
+                    .collect();
+
+                self.post_event(
+                    "reasoning",
+                    serde_json::json!({
+                        "narrative": serde_json::Value::Null,
+                        "tool_decisions": tool_decisions,
+                    }),
+                )
+                .await;
+
                 // Execute selected tools
                 for selection in &selections {
                     self.post_event(
                         "tool_use",
                         serde_json::json!({
                             "tool_name": selection.tool_name,
-                            "input": truncate(&selection.parameters.to_string(), 500),
+                            "input": redact_sensitive_json(&selection.parameters),
                         }),
                     )
                     .await;
@@ -364,7 +430,11 @@ Work independently to complete this job. Report when done."#,
                         serde_json::json!({
                             "tool_name": selection.tool_name,
                             "output": match &result {
-                                Ok(output) => truncate(output, 2000),
+                                Ok(output) => {
+                                    self.safety
+                                        .sanitize_tool_output("job_tool_result", output)
+                                        .content
+                                }
                                 Err(e) => format!("Error: {}", truncate(e, 500)),
                             },
                             "success": result.is_ok(),
@@ -510,6 +580,42 @@ Work independently to complete this job. Report when done."#,
     }
 }
 
+fn sanitize_worker_narrative(
+    safety: &crate::safety::SafetyLayer,
+    raw_content: &Option<String>,
+) -> Option<String> {
+    let text = raw_content.as_deref()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let sanitized = safety.sanitize_tool_output("reasoning", text);
+    let cleaned = sanitized.content.trim();
+    if cleaned.is_empty()
+        || cleaned == "[Output blocked due to potential secret leakage]"
+        || cleaned == "[Output blocked by safety policy]"
+    {
+        return None;
+    }
+
+    Some(cleaned.to_string())
+}
+
+fn sanitize_worker_rationale(safety: &crate::safety::SafetyLayer, raw_rationale: &str) -> String {
+    let rationale = normalize_tool_reasoning(raw_rationale);
+    let sanitized = safety.sanitize_tool_output("reasoning", &rationale);
+    let cleaned = sanitized.content.trim();
+    if cleaned.is_empty()
+        || cleaned == "[Output blocked due to potential secret leakage]"
+        || cleaned == "[Output blocked by safety policy]"
+    {
+        tracing::warn!("Worker tool rationale blocked by safety policy; applying fallback");
+        return DEFAULT_TOOL_RATIONALE.to_string();
+    }
+
+    cleaned.to_string()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -521,7 +627,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::worker::runtime::truncate;
+    use std::sync::Arc;
+
+    use crate::config::SafetyConfig;
+    use crate::llm::DEFAULT_TOOL_RATIONALE;
+    use crate::safety::SafetyLayer;
+    use crate::worker::runtime::{sanitize_worker_narrative, sanitize_worker_rationale, truncate};
 
     #[test]
     fn test_truncate_within_limit() {
@@ -545,5 +656,29 @@ mod tests {
         let result = truncate("é is fancy", 1);
         // Should truncate to 0 chars (can't fit "é" in 1 byte)
         assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn test_sanitize_worker_narrative_omits_blocked_content() {
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: true,
+        }));
+        let blocked = Some(
+            "my key is sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRST"
+                .to_string(),
+        );
+        assert!(sanitize_worker_narrative(&safety, &blocked).is_none());
+    }
+
+    #[test]
+    fn test_sanitize_worker_rationale_fallback_on_block() {
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: true,
+        }));
+        let blocked = "my key is sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRST";
+        let rationale = sanitize_worker_rationale(&safety, blocked);
+        assert_eq!(rationale, DEFAULT_TOOL_RATIONALE);
     }
 }

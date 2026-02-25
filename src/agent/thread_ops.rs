@@ -19,7 +19,33 @@ use crate::agent::submission::SubmissionResult;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, DEFAULT_TOOL_RATIONALE, normalize_tool_reasoning};
+use crate::tools::redaction::redact_sensitive_json;
+
+pub(crate) fn sanitize_pending_tool_rationale(
+    safety: &crate::safety::SafetyLayer,
+    raw: &str,
+) -> String {
+    let normalized = normalize_tool_reasoning(raw);
+    let sanitized = safety.sanitize_tool_output("reasoning", &normalized);
+    let cleaned = sanitized.content.trim();
+    if cleaned.is_empty()
+        || cleaned == "[Output blocked due to potential secret leakage]"
+        || cleaned == "[Output blocked by safety policy]"
+    {
+        DEFAULT_TOOL_RATIONALE.to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+type DeferredApprovalCandidate = (
+    usize,
+    crate::llm::ToolCall,
+    Arc<dyn crate::tools::Tool>,
+    String,
+    Option<usize>,
+);
 
 impl Agent {
     /// Hydrate a historical thread from DB into memory if not already present.
@@ -59,6 +85,30 @@ impl Agent {
         let msg_count;
 
         if let Some(store) = self.store() {
+            let owned = match store
+                .conversation_belongs_to_user(thread_uuid, &message.user_id)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        thread_id = %thread_uuid,
+                        user_id = %message.user_id,
+                        "Failed ownership check during thread hydration: {}",
+                        e
+                    );
+                    false
+                }
+            };
+            if !owned {
+                tracing::warn!(
+                    thread_id = %thread_uuid,
+                    user_id = %message.user_id,
+                    "Refusing to hydrate unowned thread"
+                );
+                return;
+            }
+
             let db_messages = store
                 .list_conversation_messages(thread_uuid)
                 .await
@@ -687,12 +737,18 @@ impl Agent {
             let mut context_messages = pending.context_messages;
             let deferred_tool_calls = pending.deferred_tool_calls;
 
-            // Record result in thread
+            // Record approved tool call + result in thread
             {
                 let mut sess = session.lock().await;
                 if let Some(thread) = sess.threads.get_mut(&thread_id)
                     && let Some(turn) = thread.last_turn_mut()
                 {
+                    turn.record_tool_call(
+                        pending.tool_name.clone(),
+                        redact_sensitive_json(&pending.parameters),
+                        pending.rationale.clone(),
+                        pending.parallel_group,
+                    );
                     match &tool_result {
                         Ok(output) => {
                             turn.record_tool_result(serde_json::json!(output));
@@ -763,11 +819,7 @@ impl Agent {
             // Walk deferred tools checking approval. Collect runnable
             // tools; stop at the first that needs approval.
             let mut runnable: Vec<crate::llm::ToolCall> = Vec::new();
-            let mut approval_needed: Option<(
-                usize,
-                crate::llm::ToolCall,
-                Arc<dyn crate::tools::Tool>,
-            )> = None;
+            let mut approval_needed: Option<DeferredApprovalCandidate> = None;
 
             for (idx, tc) in deferred_tool_calls.iter().enumerate() {
                 if let Some(tool) = self.tools().get(&tc.name).await {
@@ -782,7 +834,15 @@ impl Agent {
                     };
 
                     if needs_approval {
-                        approval_needed = Some((idx, tc.clone(), tool));
+                        let rationale =
+                            sanitize_pending_tool_rationale(self.safety(), &tc.reasoning);
+                        let pending_parallel_group = if deferred_tool_calls.len() - idx > 1 {
+                            Some(0)
+                        } else {
+                            None
+                        };
+                        approval_needed =
+                            Some((idx, tc.clone(), tool, rationale, pending_parallel_group));
                         break; // remaining tools stay deferred
                     }
                 }
@@ -934,12 +994,18 @@ impl Agent {
                         .await;
                 }
 
-                // Record in thread
+                // Record deferred tool call + result in thread
                 {
                     let mut sess = session.lock().await;
                     if let Some(thread) = sess.threads.get_mut(&thread_id)
                         && let Some(turn) = thread.last_turn_mut()
                     {
+                        turn.record_tool_call(
+                            tc.name.clone(),
+                            redact_sensitive_json(&tc.arguments),
+                            sanitize_pending_tool_rationale(self.safety(), &tc.reasoning),
+                            if runnable.len() > 1 { Some(0) } else { None },
+                        );
                         match &deferred_result {
                             Ok(output) => turn.record_tool_result(serde_json::json!(output)),
                             Err(e) => turn.record_tool_error(e.to_string()),
@@ -985,13 +1051,15 @@ impl Agent {
             }
 
             // Handle approval if a tool needed it
-            if let Some((approval_idx, tc, tool)) = approval_needed {
+            if let Some((approval_idx, tc, tool, rationale, parallel_group)) = approval_needed {
                 let new_pending = PendingApproval {
                     request_id: Uuid::new_v4(),
                     tool_name: tc.name.clone(),
                     parameters: tc.arguments.clone(),
                     description: tool.description().to_string(),
                     tool_call_id: tc.id.clone(),
+                    rationale,
+                    parallel_group,
                     context_messages: context_messages.clone(),
                     deferred_tool_calls: deferred_tool_calls[approval_idx + 1..].to_vec(),
                 };
