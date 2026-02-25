@@ -343,6 +343,7 @@ pub async fn chat_history_handler(
                         has_error: tc.error.is_some(),
                     })
                     .collect(),
+                reasoning: None,
             })
             .collect();
 
@@ -400,6 +401,7 @@ pub fn build_turns_from_db_messages(
                 started_at: msg.created_at.to_rfc3339(),
                 completed_at: None,
                 tool_calls: Vec::new(),
+                reasoning: None,
             };
 
             // Check if next message is an assistant response
