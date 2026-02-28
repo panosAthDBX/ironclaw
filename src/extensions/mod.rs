@@ -64,6 +64,9 @@ pub struct RegistryEntry {
     pub keywords: Vec<String>,
     /// Where to get this extension.
     pub source: ExtensionSource,
+    /// Fallback source when the primary source fails (e.g., download 404 → build from source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_source: Option<Box<ExtensionSource>>,
     /// How authentication works.
     pub auth_hint: AuthHint,
 }
@@ -200,6 +203,9 @@ pub struct InstalledExtension {
     /// Whether this extension is installed locally (false = available in registry but not installed).
     #[serde(default = "default_true")]
     pub installed: bool,
+    /// Last activation error for WASM channels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activation_error: Option<String>,
 }
 
 /// Error type for extension operations.

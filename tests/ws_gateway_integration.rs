@@ -59,6 +59,7 @@ async fn start_test_server() -> (
         registry_entries: Vec::new(),
         cost_guard: None,
         startup_time: std::time::Instant::now(),
+        restart_requested: std::sync::atomic::AtomicBool::new(false),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -141,6 +142,7 @@ async fn test_ws_message_reaches_agent() {
     assert_eq!(incoming.thread_id.as_deref(), Some("t42"));
     assert_eq!(incoming.channel, "gateway");
     assert_eq!(incoming.user_id, "test-user");
+    assert_eq!(incoming.metadata["thread_id"], "t42");
 
     ws.close(None).await.unwrap();
 }

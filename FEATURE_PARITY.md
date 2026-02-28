@@ -45,7 +45,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Tailscale integration | ✅ | ❌ | |
 | Health check endpoints | ✅ | ✅ | /api/health + /api/gateway/status |
 | `doctor` diagnostics | ✅ | ❌ | |
-| Agent event broadcast | ✅ | 🚧 | SSE broadcast manager exists (SseManager) but tool/job-state events not fully wired |
+| Agent event broadcast | ✅ | 🚧 | SSE broadcast manager exists; reasoning_update and job_reasoning are wired, but broader tool/job-state parity remains incomplete |
 | Channel health monitor | ✅ | ❌ | Auto-restart with configurable interval |
 | Presence system | ✅ | ❌ | Beacons on connect, system presence for agents |
 | Trusted-proxy auth mode | ✅ | ❌ | Header-based auth for reverse proxies |
@@ -68,7 +68,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | WhatsApp | ✅ | ❌ | P1 | Baileys (Web), same-phone mode with echo detection |
 | Telegram | ✅ | ✅ | - | WASM channel(MTProto), DM pairing, caption, /start, bot_username |
 | Discord | ✅ | ❌ | P2 | discord.js, thread parent binding inheritance |
-| Signal | ✅ | ❌ | P2 | signal-cli |
+| Signal | ✅ | ✅ | P2 | signal-cli daemonPC, SSE listener HTTP/JSON-R, user/group allowlists, DM pairing |
 | Slack | ✅ | ✅ | - | WASM tool |
 | iMessage | ✅ | ❌ | P3 | BlueBubbles or Linq recommended |
 | Linq | ✅ | ❌ | P3 | Real iMessage via API, no Mac required |
@@ -158,7 +158,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | `doctor` | ✅ | ❌ | P2 | Diagnostics |
 | `logs` | ✅ | ❌ | P3 | Query logs |
 | `update` | ✅ | ❌ | P3 | Self-update |
-| `completion` | ✅ | ❌ | P3 | Shell completion |
+| `completion` | ✅ | ✅ | - | Shell completion |
 | `/subagents spawn` | ✅ | ❌ | P3 | Spawn subagents from chat |
 | `/export-session` | ✅ | ❌ | P3 | Export current session transcript |
 
@@ -540,7 +540,6 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ### P3 - Lower Priority
 - ❌ Discord channel
-- ❌ Signal channel
 - ❌ Matrix channel
 - ❌ Other messaging platforms
 - ❌ TTS/audio features

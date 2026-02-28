@@ -15,6 +15,17 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning};
 
+/// Format a count with a suffix, using K/M abbreviations for large numbers.
+fn format_count(n: u64, suffix: &str) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M {}", n as f64 / 1_000_000.0, suffix)
+    } else if n >= 1_000 {
+        format!("{:.1}K {}", n as f64 / 1_000.0, suffix)
+    } else {
+        format!("{} {}", n, suffix)
+    }
+}
+
 impl Agent {
     /// Handle job-related intents without turn tracking.
     pub(super) async fn handle_job_or_command(
@@ -209,6 +220,33 @@ impl Agent {
         }
     }
 
+    /// Show job status inline — either all jobs (no id) or a specific job.
+    pub(super) async fn process_job_status(
+        &self,
+        user_id: &str,
+        job_id: Option<&str>,
+    ) -> Result<SubmissionResult, Error> {
+        match self
+            .handle_check_status(user_id, job_id.map(|s| s.to_string()))
+            .await
+        {
+            Ok(text) => Ok(SubmissionResult::response(text)),
+            Err(e) => Ok(SubmissionResult::error(format!("Job status error: {}", e))),
+        }
+    }
+
+    /// Cancel a job by ID.
+    pub(super) async fn process_job_cancel(
+        &self,
+        user_id: &str,
+        job_id: &str,
+    ) -> Result<SubmissionResult, Error> {
+        match self.handle_cancel_job(user_id, job_id).await {
+            Ok(text) => Ok(SubmissionResult::response(text)),
+            Err(e) => Ok(SubmissionResult::error(format!("Cancel error: {}", e))),
+        }
+    }
+
     /// Trigger a manual heartbeat check.
     pub(super) async fn process_heartbeat(&self) -> Result<SubmissionResult, Error> {
         let Some(workspace) = self.workspace() else {
@@ -341,6 +379,126 @@ impl Agent {
         }
     }
 
+    pub(super) async fn process_reasoning(
+        &self,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        arg: Option<String>,
+    ) -> Result<SubmissionResult, Error> {
+        let sess = session.lock().await;
+        let thread = sess
+            .threads
+            .get(&thread_id)
+            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+
+        let format_turn = |turn: &crate::agent::session::Turn| -> String {
+            if turn.tool_calls.is_empty() {
+                return format!("  ─ Turn {} had no tool calls.", turn.turn_number + 1);
+            }
+
+            let mut out = format!("  ┄ Reasoning — turn {}\n", turn.turn_number + 1);
+            if let Some(narrative) = turn.narrative.as_deref().map(str::trim)
+                && !narrative.is_empty()
+            {
+                out.push_str(&format!("  Narrative: \"{}\"\n", narrative));
+            }
+
+            let mut groups: std::collections::BTreeMap<
+                Option<usize>,
+                Vec<&crate::agent::session::TurnToolCall>,
+            > = std::collections::BTreeMap::new();
+            for call in &turn.tool_calls {
+                groups.entry(call.parallel_group).or_default().push(call);
+            }
+
+            for (group, calls) in groups {
+                if let Some(g) = group
+                    && calls.len() > 1
+                {
+                    out.push_str(&format!("\n  ┄ [parallel batch {}]\n", g));
+                }
+
+                for call in calls {
+                    let prefix = if call.parallel_group.is_some() && turn.tool_calls.len() > 1 {
+                        "  ┄   ↳"
+                    } else {
+                        "  ┄"
+                    };
+                    out.push_str(&format!("{} {}\n", prefix, call.name));
+                    out.push_str(&format!("    rationale: \"{}\"\n", call.rationale.trim()));
+
+                    let params = crate::tools::redaction::redact_sensitive_json(&call.parameters)
+                        .to_string();
+                    let params_preview = if params.chars().count() > 200 {
+                        let truncated: String = params.chars().take(200).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        params
+                    };
+                    out.push_str(&format!("    params:    {}\n", params_preview));
+
+                    let outcome = if let Some(err) = &call.error {
+                        format!("error ({})", err)
+                    } else if call.result.is_some() {
+                        "success".to_string()
+                    } else {
+                        "pending".to_string()
+                    };
+                    out.push_str(&format!("    outcome:   {}\n", outcome));
+                }
+            }
+
+            out.trim_end().to_string()
+        };
+
+        let response = match arg.as_deref().map(str::trim) {
+            None => {
+                if let Some(turn) = thread.turns.last() {
+                    format_turn(turn)
+                } else {
+                    "  ✗ No turns in this thread yet.".to_string()
+                }
+            }
+            Some("all") => {
+                if thread.turns.is_empty() {
+                    "  ✗ No turns in this thread yet.".to_string()
+                } else {
+                    thread
+                        .turns
+                        .iter()
+                        .map(format_turn)
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                }
+            }
+            Some(raw_turn) => {
+                let turn_number = match raw_turn.parse::<usize>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        return Ok(SubmissionResult::error(
+                            "Usage: /reasoning [N|all] (N must be >= 1)",
+                        ));
+                    }
+                };
+
+                if let Some(turn) = thread
+                    .turns
+                    .iter()
+                    .find(|t| t.turn_number + 1 == turn_number)
+                {
+                    format_turn(turn)
+                } else {
+                    format!(
+                        "  ✗ No reasoning data for turn {} in this thread.",
+                        turn_number
+                    )
+                }
+            }
+        };
+
+        Ok(SubmissionResult::response(response))
+    }
+
     /// Handle system commands that bypass thread-state checks entirely.
     pub(super) async fn handle_system_command(
         &self,
@@ -373,10 +531,15 @@ impl Agent {
                 "  /thread <id>      Switch to thread\n",
                 "  /resume <id>      Resume from checkpoint\n",
                 "\n",
+                "Skills:\n",
+                "  /skills             List installed skills\n",
+                "  /skills search <q>  Search ClawHub registry\n",
+                "\n",
                 "Agent:\n",
                 "  /heartbeat        Run heartbeat check\n",
                 "  /summarize        Summarize current thread\n",
                 "  /suggest          Suggest next steps\n",
+                "  /reasoning [N|all] Show reasoning summaries\n",
                 "\n",
                 "  /quit             Exit",
             ))),
@@ -403,6 +566,22 @@ impl Agent {
                 Ok(SubmissionResult::ok_with_message(
                     "Debug toggle is handled by your client.",
                 ))
+            }
+
+            "skills" => {
+                if args.first().map(|s| s.as_str()) == Some("search") {
+                    let query = args[1..].join(" ");
+                    if query.is_empty() {
+                        return Ok(SubmissionResult::error("Usage: /skills search <query>"));
+                    }
+                    self.handle_skills_search(&query).await
+                } else if args.is_empty() {
+                    self.handle_skills_list().await
+                } else {
+                    Ok(SubmissionResult::error(
+                        "Usage: /skills or /skills search <query>",
+                    ))
+                }
             }
 
             "model" => {
@@ -475,6 +654,129 @@ impl Agent {
         }
     }
 
+    /// List installed skills.
+    async fn handle_skills_list(&self) -> Result<SubmissionResult, Error> {
+        let Some(registry) = self.skill_registry() else {
+            return Ok(SubmissionResult::error("Skills system not enabled."));
+        };
+
+        let guard = match registry.read() {
+            Ok(g) => g,
+            Err(e) => {
+                return Ok(SubmissionResult::error(format!(
+                    "Skill registry lock error: {}",
+                    e
+                )));
+            }
+        };
+
+        let skills = guard.skills();
+        if skills.is_empty() {
+            return Ok(SubmissionResult::response(
+                "No skills installed.\n\nUse /skills search <query> to find skills on ClawHub.",
+            ));
+        }
+
+        let mut out = String::from("Installed skills:\n\n");
+        for s in skills {
+            let desc = if s.manifest.description.chars().count() > 60 {
+                let truncated: String = s.manifest.description.chars().take(57).collect();
+                format!("{}...", truncated)
+            } else {
+                s.manifest.description.clone()
+            };
+            out.push_str(&format!(
+                "  {:<24} v{:<10} [{}]  {}\n",
+                s.manifest.name, s.manifest.version, s.trust, desc,
+            ));
+        }
+        out.push_str("\nUse /skills search <query> to find more on ClawHub.");
+
+        Ok(SubmissionResult::response(out))
+    }
+
+    /// Search ClawHub for skills.
+    async fn handle_skills_search(&self, query: &str) -> Result<SubmissionResult, Error> {
+        let catalog = match self.skill_catalog() {
+            Some(c) => c,
+            None => {
+                return Ok(SubmissionResult::error("Skill catalog not available."));
+            }
+        };
+
+        let outcome = catalog.search(query).await;
+
+        // Enrich top results with detail data (stars, downloads, owner)
+        let mut entries = outcome.results;
+        catalog.enrich_search_results(&mut entries, 5).await;
+
+        let mut out = format!("ClawHub results for \"{}\":\n\n", query);
+
+        if entries.is_empty() {
+            if let Some(ref err) = outcome.error {
+                out.push_str(&format!("  (registry error: {})\n", err));
+            } else {
+                out.push_str("  No results found.\n");
+            }
+        } else {
+            for entry in &entries {
+                let owner_str = entry
+                    .owner
+                    .as_deref()
+                    .map(|o| format!("  by {}", o))
+                    .unwrap_or_default();
+
+                let stats_parts: Vec<String> = [
+                    entry.stars.map(|s| format!("{} stars", s)),
+                    entry.downloads.map(|d| format_count(d, "downloads")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let stats_str = if stats_parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", stats_parts.join("  "))
+                };
+
+                out.push_str(&format!(
+                    "  {:<24} v{:<10}{}{}\n",
+                    entry.name, entry.version, owner_str, stats_str,
+                ));
+                if !entry.description.is_empty() {
+                    out.push_str(&format!("    {}\n\n", entry.description));
+                }
+            }
+        }
+
+        // Show matching installed skills
+        if let Some(registry) = self.skill_registry()
+            && let Ok(guard) = registry.read()
+        {
+            let query_lower = query.to_lowercase();
+            let matches: Vec<_> = guard
+                .skills()
+                .iter()
+                .filter(|s| {
+                    s.manifest.name.to_lowercase().contains(&query_lower)
+                        || s.manifest.description.to_lowercase().contains(&query_lower)
+                })
+                .collect();
+
+            if !matches.is_empty() {
+                out.push_str(&format!("Installed skills matching \"{}\":\n", query));
+                for s in &matches {
+                    out.push_str(&format!(
+                        "  {:<24} v{:<10} [{}]\n",
+                        s.manifest.name, s.manifest.version, s.trust,
+                    ));
+                }
+            }
+        }
+
+        Ok(SubmissionResult::response(out))
+    }
+
     /// Handle legacy command routing from the Router (job commands that go through
     /// process_user_input -> router -> handle_job_or_command -> here).
     pub(super) async fn handle_command(
@@ -489,6 +791,220 @@ impl Agent {
             SubmissionResult::Ok { message } => Ok(message),
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             _ => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use rust_decimal::Decimal;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    use crate::agent::Agent;
+    use crate::agent::agent_loop::AgentDeps;
+    use crate::agent::cost_guard::{CostGuard, CostGuardConfig};
+    use crate::agent::session::Session;
+    use crate::agent::submission::SubmissionResult;
+    use crate::channels::ChannelManager;
+    use crate::config::{AgentConfig, SafetyConfig, SkillsConfig};
+    use crate::context::ContextManager;
+    use crate::hooks::HookRegistry;
+    use crate::llm::{
+        CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCompletionRequest,
+        ToolCompletionResponse,
+    };
+    use crate::safety::SafetyLayer;
+    use crate::tools::ToolRegistry;
+
+    struct StaticLlmProvider;
+
+    #[async_trait]
+    impl LlmProvider for StaticLlmProvider {
+        fn model_name(&self) -> &str {
+            "static-mock"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "ok".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            Ok(ToolCompletionResponse {
+                content: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    fn make_test_agent() -> Agent {
+        let deps = AgentDeps {
+            store: None,
+            llm: Arc::new(StaticLlmProvider),
+            cheap_llm: None,
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: true,
+            })),
+            tools: Arc::new(ToolRegistry::new()),
+            workspace: None,
+            extension_manager: None,
+            skill_registry: None,
+            skill_catalog: None,
+            skills_config: SkillsConfig::default(),
+            hooks: Arc::new(HookRegistry::new()),
+            cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+        };
+
+        Agent::new(
+            AgentConfig {
+                name: "test-agent".to_string(),
+                max_parallel_jobs: 1,
+                job_timeout: Duration::from_secs(60),
+                stuck_threshold: Duration::from_secs(60),
+                repair_check_interval: Duration::from_secs(30),
+                max_repair_attempts: 1,
+                use_planning: false,
+                session_idle_timeout: Duration::from_secs(300),
+                allow_local_tools: false,
+                max_cost_per_day_cents: None,
+                max_actions_per_hour: None,
+                max_tool_iterations: 50,
+                auto_approve_tools: false,
+            },
+            deps,
+            Arc::new(ChannelManager::new()),
+            None,
+            None,
+            None,
+            Some(Arc::new(ContextManager::new(1))),
+            None,
+        )
+    }
+
+    fn session_with_reasoning_turn() -> (Arc<Mutex<Session>>, Uuid) {
+        let mut sess = Session::new("user-test");
+        let thread_id = sess.create_thread().id;
+
+        {
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .expect("thread should exist");
+            let turn = thread.start_turn("hello");
+            turn.record_tool_call(
+                "echo",
+                serde_json::json!({"message": "hi"}),
+                "confirm greeting".to_string(),
+                None,
+            );
+            turn.record_tool_result(serde_json::json!("hi"));
+            thread.complete_turn("done");
+            thread.updated_at = thread
+                .updated_at
+                .checked_add_signed(chrono::TimeDelta::seconds(1))
+                .expect("valid timestamp shift");
+        }
+
+        (Arc::new(Mutex::new(sess)), thread_id)
+    }
+
+    #[tokio::test]
+    async fn test_process_reasoning_out_of_range_turn() {
+        let agent = make_test_agent();
+        let (session, thread_id) = session_with_reasoning_turn();
+
+        let result = agent
+            .process_reasoning(session, thread_id, Some("99".to_string()))
+            .await
+            .expect("process_reasoning should succeed");
+
+        match result {
+            SubmissionResult::Response { content } => {
+                assert!(content.contains("No reasoning data for turn 99"));
+            }
+            _ => panic!("expected response submission result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_reasoning_invalid_turn_usage_error() {
+        let agent = make_test_agent();
+        let (session, thread_id) = session_with_reasoning_turn();
+
+        let result = agent
+            .process_reasoning(session, thread_id, Some("0".to_string()))
+            .await
+            .expect("process_reasoning should succeed");
+
+        match result {
+            SubmissionResult::Error { message } => {
+                assert_eq!(message, "Usage: /reasoning [N|all] (N must be >= 1)");
+            }
+            _ => panic!("expected error submission result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_reasoning_redacts_sensitive_parameters_in_output() {
+        let agent = make_test_agent();
+        let mut sess = Session::new("user-test");
+        let thread_id = sess.create_thread().id;
+
+        {
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .expect("thread should exist");
+            let turn = thread.start_turn("hello");
+            turn.record_tool_call(
+                "http",
+                serde_json::json!({
+                    "headers": { "Authorization": "Bearer abc" },
+                    "token": "secret-token"
+                }),
+                "call http".to_string(),
+                None,
+            );
+            turn.record_tool_result(serde_json::json!("ok"));
+            thread.complete_turn("done");
+        }
+
+        let session = Arc::new(Mutex::new(sess));
+        let result = agent
+            .process_reasoning(session, thread_id, None)
+            .await
+            .expect("process_reasoning should succeed");
+
+        match result {
+            SubmissionResult::Response { content } => {
+                assert!(content.contains("[REDACTED]"));
+                assert!(!content.contains("secret-token"));
+                assert!(!content.contains("Bearer abc"));
+            }
+            _ => panic!("expected response submission result"),
         }
     }
 }

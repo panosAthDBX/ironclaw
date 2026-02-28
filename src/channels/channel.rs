@@ -1,5 +1,6 @@
 //! Channel trait and message types.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -78,6 +79,8 @@ pub struct OutgoingResponse {
     pub content: String,
     /// Optional thread ID to reply in.
     pub thread_id: Option<String>,
+    /// Optional file paths to attach.
+    pub attachments: Vec<String>,
     /// Channel-specific metadata for the response.
     pub metadata: serde_json::Value,
 }
@@ -88,6 +91,7 @@ impl OutgoingResponse {
         Self {
             content: content.into(),
             thread_id: None,
+            attachments: Vec::new(),
             metadata: serde_json::Value::Null,
         }
     }
@@ -97,6 +101,21 @@ impl OutgoingResponse {
         self.thread_id = Some(thread_id.into());
         self
     }
+
+    /// Add attachments to the response.
+    pub fn with_attachments(mut self, paths: Vec<String>) -> Self {
+        self.attachments = paths;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReasoningDecisionUpdate {
+    pub tool_call_id: Option<String>,
+    pub tool_name: String,
+    pub rationale: String,
+    pub outcome: String,
+    pub parallel_group: Option<usize>,
 }
 
 /// Status update types for showing agent activity.
@@ -112,6 +131,14 @@ pub enum StatusUpdate {
     ToolResult { name: String, preview: String },
     /// Streaming text chunk.
     StreamChunk(String),
+    /// Structured reasoning summary update.
+    ReasoningUpdate {
+        session_id: String,
+        thread_id: String,
+        turn_number: usize,
+        narrative: Option<String>,
+        tool_decisions: Vec<ReasoningDecisionUpdate>,
+    },
     /// General status message.
     Status(String),
     /// A sandbox job has started (shown as a clickable card in the UI).
@@ -198,8 +225,30 @@ pub trait Channel: Send + Sync {
     /// Check if the channel is healthy.
     async fn health_check(&self) -> Result<(), ChannelError>;
 
+    /// Get conversation context from message metadata for system prompt.
+    ///
+    /// Returns key-value pairs like "sender", "sender_uuid", "group" that
+    /// help the LLM understand who it's talking to.
+    ///
+    /// Default implementation returns empty map.
+    fn conversation_context(&self, _metadata: &serde_json::Value) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     /// Gracefully shut down the channel.
     async fn shutdown(&self) -> Result<(), ChannelError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IncomingMessage;
+
+    #[test]
+    fn with_metadata_sets_metadata_value() {
+        let msg = IncomingMessage::new("gateway", "user", "hello")
+            .with_metadata(serde_json::json!({"thread_id": "tid-1"}));
+        assert_eq!(msg.metadata["thread_id"], "tid-1");
     }
 }

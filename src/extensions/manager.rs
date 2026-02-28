@@ -52,6 +52,14 @@ struct ChannelRuntimeState {
     telegram_owner_id: Option<i64>,
 }
 
+/// Result of saving setup secrets and attempting activation.
+pub struct SetupResult {
+    /// Human-readable status message.
+    pub message: String,
+    /// Whether the channel was successfully activated after saving secrets.
+    pub activated: bool,
+}
+
 /// Central manager for extension lifecycle operations.
 pub struct ExtensionManager {
     registry: ExtensionRegistry,
@@ -82,6 +90,11 @@ pub struct ExtensionManager {
     store: Option<Arc<dyn crate::db::Database>>,
     /// Names of WASM channels that were successfully loaded at startup.
     active_channel_names: RwLock<HashSet<String>>,
+    /// Last activation error for each WASM channel (ephemeral, cleared on success).
+    activation_errors: RwLock<HashMap<String, String>>,
+    /// SSE broadcast sender (set post-construction via `set_sse_sender()`).
+    sse_sender:
+        RwLock<Option<tokio::sync::broadcast::Sender<crate::channels::web::types::SseEvent>>>,
 }
 
 impl ExtensionManager {
@@ -121,6 +134,8 @@ impl ExtensionManager {
             user_id,
             store,
             active_channel_names: RwLock::new(HashSet::new()),
+            activation_errors: RwLock::new(HashMap::new()),
+            sse_sender: RwLock::new(None),
         }
     }
 
@@ -151,6 +166,25 @@ impl ExtensionManager {
     pub async fn set_active_channels(&self, names: Vec<String>) {
         let mut active = self.active_channel_names.write().await;
         active.extend(names);
+    }
+
+    /// Set the SSE broadcast sender for pushing extension status events to the web UI.
+    pub async fn set_sse_sender(
+        &self,
+        sender: tokio::sync::broadcast::Sender<crate::channels::web::types::SseEvent>,
+    ) {
+        *self.sse_sender.write().await = Some(sender);
+    }
+
+    /// Broadcast an extension status change to the web UI via SSE.
+    async fn broadcast_extension_status(&self, name: &str, status: &str, message: Option<&str>) {
+        if let Some(ref sender) = *self.sse_sender.read().await {
+            let _ = sender.send(crate::channels::web::types::SseEvent::ExtensionStatus {
+                extension_name: name.to_string(),
+                status: status.to_string(),
+                message: message.map(|m| m.to_string()),
+            });
+        }
     }
 
     /// Search for extensions. If `discover` is true, also searches online.
@@ -191,9 +225,10 @@ impl ExtensionManager {
         kind_hint: Option<ExtensionKind>,
     ) -> Result<InstallResult, ExtensionError> {
         tracing::info!(extension = %name, url = ?url, kind = ?kind_hint, "Installing extension");
+        Self::validate_extension_name(name)?;
 
-        // If we have a registry entry, use it
-        if let Some(entry) = self.registry.get(name).await {
+        // If we have a registry entry, use it (prefer kind_hint to resolve collisions)
+        if let Some(entry) = self.registry.get_with_kind(name, kind_hint).await {
             return self.install_from_entry(&entry).await.map_err(|e| {
                 tracing::error!(extension = %name, error = %e, "Extension install failed");
                 e
@@ -245,6 +280,7 @@ impl ExtensionManager {
 
     /// Activate an installed (and optionally authenticated) extension.
     pub async fn activate(&self, name: &str) -> Result<ActivateResult, ExtensionError> {
+        Self::validate_extension_name(name)?;
         let kind = self.determine_installed_kind(name).await?;
 
         match kind {
@@ -297,6 +333,7 @@ impl ExtensionManager {
                             tools,
                             needs_setup: false,
                             installed: true,
+                            activation_error: None,
                         });
                     }
                 }
@@ -325,6 +362,7 @@ impl ExtensionManager {
                             tools: if active { vec![name] } else { Vec::new() },
                             needs_setup: false,
                             installed: true,
+                            activation_error: None,
                         });
                     }
                 }
@@ -341,10 +379,12 @@ impl ExtensionManager {
             match crate::channels::wasm::discover_channels(&self.wasm_channels_dir).await {
                 Ok(channels) => {
                     let active_names = self.active_channel_names.read().await;
+                    let errors = self.activation_errors.read().await;
                     for (name, _discovered) in channels {
                         let active = active_names.contains(&name);
                         let (authenticated, needs_setup) =
                             self.check_channel_auth_status(&name).await;
+                        let activation_error = errors.get(&name).cloned();
                         extensions.push(InstalledExtension {
                             name,
                             kind: ExtensionKind::WasmChannel,
@@ -355,6 +395,7 @@ impl ExtensionManager {
                             tools: Vec::new(),
                             needs_setup,
                             installed: true,
+                            activation_error,
                         });
                     }
                 }
@@ -390,6 +431,7 @@ impl ExtensionManager {
                     tools: Vec::new(),
                     needs_setup: false,
                     installed: false,
+                    activation_error: None,
                 });
             }
         }
@@ -399,6 +441,7 @@ impl ExtensionManager {
 
     /// Remove an installed extension.
     pub async fn remove(&self, name: &str) -> Result<String, ExtensionError> {
+        Self::validate_extension_name(name)?;
         let kind = self.determine_installed_kind(name).await?;
 
         match kind {
@@ -546,9 +589,40 @@ impl ExtensionManager {
         &self,
         entry: &RegistryEntry,
     ) -> Result<InstallResult, ExtensionError> {
+        let primary_result = self.try_install_from_source(entry, &entry.source).await;
+        match fallback_decision(&primary_result, &entry.fallback_source) {
+            FallbackDecision::Return => primary_result,
+            FallbackDecision::TryFallback => {
+                let primary_err = primary_result.unwrap_err();
+                let fallback = entry.fallback_source.as_ref().unwrap();
+                tracing::info!(
+                    extension = %entry.name,
+                    primary_error = %primary_err,
+                    "Primary install failed, trying fallback source"
+                );
+                self.try_install_from_source(entry, fallback)
+                    .await
+                    .map_err(|fallback_err| {
+                        tracing::error!(
+                            extension = %entry.name,
+                            fallback_error = %fallback_err,
+                            "Fallback install also failed"
+                        );
+                        combine_install_errors(&primary_err, fallback_err)
+                    })
+            }
+        }
+    }
+
+    /// Attempt to install an extension using a specific source.
+    async fn try_install_from_source(
+        &self,
+        entry: &RegistryEntry,
+        source: &ExtensionSource,
+    ) -> Result<InstallResult, ExtensionError> {
         match entry.kind {
             ExtensionKind::McpServer => {
-                let url = match &entry.source {
+                let url = match source {
                     ExtensionSource::McpUrl { url } => url.clone(),
                     ExtensionSource::Discovered { url } => url.clone(),
                     _ => {
@@ -559,7 +633,7 @@ impl ExtensionManager {
                 };
                 self.install_mcp_from_url(&entry.name, &url).await
             }
-            ExtensionKind::WasmTool => match &entry.source {
+            ExtensionKind::WasmTool => match source {
                 ExtensionSource::WasmDownload {
                     wasm_url,
                     capabilities_url,
@@ -586,10 +660,10 @@ impl ExtensionManager {
                     .await
                 }
                 _ => Err(ExtensionError::InstallFailed(
-                    "WASM tool entry has no download URL".to_string(),
+                    "WASM tool entry has no download URL or build info".to_string(),
                 )),
             },
-            ExtensionKind::WasmChannel => match &entry.source {
+            ExtensionKind::WasmChannel => match source {
                 ExtensionSource::WasmDownload {
                     wasm_url,
                     capabilities_url,
@@ -616,7 +690,7 @@ impl ExtensionManager {
                     .await
                 }
                 _ => Err(ExtensionError::InstallFailed(
-                    "WASM channel entry has no download URL".to_string(),
+                    "WASM channel entry has no download URL or build info".to_string(),
                 )),
             },
         }
@@ -1701,14 +1775,6 @@ impl ExtensionManager {
             )));
         }
 
-        // Validate name to prevent path traversal
-        if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
-            return Err(ExtensionError::ActivationFailed(format!(
-                "Invalid channel name '{}': contains path separator or traversal characters",
-                name
-            )));
-        }
-
         // Load the channel from files
         let wasm_path = self.wasm_channels_dir.join(format!("{}.wasm", name));
         let cap_path = self
@@ -1720,8 +1786,13 @@ impl ExtensionManager {
             None
         };
 
-        let loader =
-            WasmChannelLoader::new(Arc::clone(&channel_runtime), Arc::clone(&pairing_store));
+        let settings_store: Option<Arc<dyn crate::db::SettingsStore>> =
+            self.store.as_ref().map(|db| Arc::clone(db) as _);
+        let loader = WasmChannelLoader::new(
+            Arc::clone(&channel_runtime),
+            Arc::clone(&pairing_store),
+            settings_store,
+        );
         let loaded = loader
             .load_from_files(name, &wasm_path, cap_path_option)
             .await
@@ -1730,6 +1801,7 @@ impl ExtensionManager {
         let channel_name = loaded.name().to_string();
         let webhook_secret_name = loaded.webhook_secret_name();
         let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
+        let sig_key_secret_name = loaded.signature_key_secret_name();
 
         // Get webhook secret from secrets store
         let webhook_secret = self
@@ -1795,6 +1867,26 @@ impl ExtensionManager {
                 )
                 .await;
             tracing::info!(channel = %channel_name, "Registered hot-activated channel with webhook router");
+
+            // Register Ed25519 signature key if declared in capabilities
+            if let Some(ref sig_key_name) = sig_key_secret_name
+                && let Ok(key_secret) = self
+                    .secrets
+                    .get_decrypted(&self.user_id, sig_key_name)
+                    .await
+            {
+                match wasm_channel_router
+                    .register_signature_key(&channel_name, key_secret.expose())
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(channel = %channel_name, "Registered signature key for hot-activated channel")
+                    }
+                    Err(e) => {
+                        tracing::error!(channel = %channel_name, error = %e, "Failed to register signature key")
+                    }
+                }
+            }
         }
 
         // Inject credentials
@@ -1930,6 +2022,37 @@ impl ExtensionManager {
             existing_channel.update_config(config_updates).await;
         }
 
+        // Also refresh signature key in the router
+        let sig_key_secret_name = {
+            let cap_path = self
+                .wasm_channels_dir
+                .join(format!("{}.capabilities.json", name));
+            match tokio::fs::read(&cap_path).await {
+                Ok(bytes) => crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&bytes)
+                    .ok()
+                    .and_then(|f| f.signature_key_secret_name().map(|s| s.to_string())),
+                Err(_) => None,
+            }
+        };
+        if let Some(ref sig_key_name) = sig_key_secret_name
+            && let Ok(key_secret) = self
+                .secrets
+                .get_decrypted(&self.user_id, sig_key_name)
+                .await
+        {
+            match router
+                .register_signature_key(name, key_secret.expose())
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(channel = %name, "Refreshed signature verification key")
+                }
+                Err(e) => {
+                    tracing::error!(channel = %name, error = %e, "Failed to refresh signature key")
+                }
+            }
+        }
+
         // Refresh tunnel_url in case it wasn't set at startup
         if let Some(ref tunnel_url) = self.tunnel_url {
             let mut config_updates = std::collections::HashMap::new();
@@ -2002,6 +2125,17 @@ impl ExtensionManager {
         )))
     }
 
+    /// Reject names containing path separators or traversal sequences.
+    fn validate_extension_name(name: &str) -> Result<(), ExtensionError> {
+        if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+            return Err(ExtensionError::InstallFailed(format!(
+                "Invalid extension name '{}': contains path separator or traversal characters",
+                name
+            )));
+        }
+        Ok(())
+    }
+
     async fn cleanup_expired_auths(&self) {
         let mut pending = self.pending_auth.write().await;
         pending.retain(|_, auth| auth.created_at.elapsed() < std::time::Duration::from_secs(300));
@@ -2050,11 +2184,14 @@ impl ExtensionManager {
     }
 
     /// Save setup secrets for an extension, validating names against the capabilities schema.
+    ///
+    /// After saving, attempts to hot-activate the channel. Returns a [`SetupResult`]
+    /// indicating whether activation succeeded (so the frontend can show appropriate UI).
     pub async fn save_setup_secrets(
         &self,
         name: &str,
         secrets: &std::collections::HashMap<String, String>,
-    ) -> Result<String, ExtensionError> {
+    ) -> Result<SetupResult, ExtensionError> {
         let kind = self.determine_installed_kind(name).await?;
         if kind != ExtensionKind::WasmChannel {
             return Err(ExtensionError::Other(
@@ -2137,21 +2274,38 @@ impl ExtensionManager {
 
         // Try to hot-activate the channel now that secrets are saved
         match self.activate_wasm_channel(name).await {
-            Ok(result) => Ok(format!(
-                "Configuration saved and channel '{}' activated. {}",
-                name, result.message
-            )),
+            Ok(result) => {
+                self.activation_errors.write().await.remove(name);
+                self.broadcast_extension_status(name, "active", None).await;
+                Ok(SetupResult {
+                    message: format!(
+                        "Configuration saved and channel '{}' activated. {}",
+                        name, result.message
+                    ),
+                    activated: true,
+                })
+            }
             Err(e) => {
+                let error_msg = e.to_string();
                 tracing::warn!(
                     channel = name,
                     error = %e,
                     "Saved configuration but hot-activation failed, restart may be needed"
                 );
-                Ok(format!(
-                    "Configuration saved for '{}'. \
-                     Automatic activation failed ({}), restart IronClaw to activate.",
-                    name, e
-                ))
+                self.activation_errors
+                    .write()
+                    .await
+                    .insert(name.to_string(), error_msg.clone());
+                self.broadcast_extension_status(name, "failed", Some(&error_msg))
+                    .await;
+                Ok(SetupResult {
+                    message: format!(
+                        "Configuration saved for '{}'. \
+                         Automatic activation failed ({}), restart IronClaw to activate.",
+                        name, e
+                    ),
+                    activated: false,
+                })
             }
         }
     }
@@ -2228,10 +2382,56 @@ fn infer_kind_from_url(url: &str) -> ExtensionKind {
     }
 }
 
+/// Decision from `fallback_decision`: should we try the fallback source or
+/// return the primary result as-is?
+enum FallbackDecision {
+    /// Return the primary result directly (success or non-retriable error).
+    Return,
+    /// Primary failed with a retriable error and a fallback source is available.
+    TryFallback,
+}
+
+/// Decide whether to attempt a fallback install based on the primary result
+/// and the availability of a fallback source.
+fn fallback_decision(
+    primary_result: &Result<InstallResult, ExtensionError>,
+    fallback_source: &Option<Box<ExtensionSource>>,
+) -> FallbackDecision {
+    match (primary_result, fallback_source) {
+        // Success — no fallback needed
+        (Ok(_), _) => FallbackDecision::Return,
+        // AlreadyInstalled — don't try building from source
+        (Err(ExtensionError::AlreadyInstalled(_)), _) => FallbackDecision::Return,
+        // Failed with a fallback available — try it
+        (Err(_), Some(_)) => FallbackDecision::TryFallback,
+        // Failed with no fallback — return the error
+        (Err(_), None) => FallbackDecision::Return,
+    }
+}
+
+/// Combine primary and fallback errors into a single error.
+///
+/// Preserves `AlreadyInstalled` from the fallback directly; otherwise wraps
+/// both error messages into `ExtensionError::Other`.
+fn combine_install_errors(
+    primary_err: &ExtensionError,
+    fallback_err: ExtensionError,
+) -> ExtensionError {
+    if matches!(fallback_err, ExtensionError::AlreadyInstalled(_)) {
+        return fallback_err;
+    }
+    ExtensionError::Other(format!(
+        "Primary install failed: {}; fallback install also failed: {}",
+        primary_err, fallback_err
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::extensions::ExtensionKind;
-    use crate::extensions::manager::infer_kind_from_url;
+    use crate::extensions::manager::{
+        FallbackDecision, combine_install_errors, fallback_decision, infer_kind_from_url,
+    };
+    use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
 
     #[test]
     fn test_infer_kind_from_url() {
@@ -2251,5 +2451,182 @@ mod tests {
             infer_kind_from_url("https://example.com/mcp"),
             ExtensionKind::McpServer
         );
+    }
+
+    // ---- fallback install logic tests ----
+
+    fn make_ok_result() -> Result<InstallResult, ExtensionError> {
+        Ok(InstallResult {
+            name: "test".to_string(),
+            kind: ExtensionKind::WasmTool,
+            message: "Installed".to_string(),
+        })
+    }
+
+    fn make_fallback_source() -> Option<Box<ExtensionSource>> {
+        Some(Box::new(ExtensionSource::WasmBuildable {
+            repo_url: "tools-src/test".to_string(),
+            build_dir: Some("tools-src/test".to_string()),
+            crate_name: Some("test-tool".to_string()),
+        }))
+    }
+
+    #[test]
+    fn test_fallback_decision_success_returns_directly() {
+        let result = make_ok_result();
+        let fallback = make_fallback_source();
+        assert!(matches!(
+            fallback_decision(&result, &fallback),
+            FallbackDecision::Return
+        ));
+    }
+
+    #[test]
+    fn test_fallback_decision_already_installed_skips_fallback() {
+        let result: Result<InstallResult, ExtensionError> =
+            Err(ExtensionError::AlreadyInstalled("test".to_string()));
+        let fallback = make_fallback_source();
+        assert!(matches!(
+            fallback_decision(&result, &fallback),
+            FallbackDecision::Return
+        ));
+    }
+
+    #[test]
+    fn test_fallback_decision_download_failed_triggers_fallback() {
+        let result: Result<InstallResult, ExtensionError> =
+            Err(ExtensionError::DownloadFailed("404 Not Found".to_string()));
+        let fallback = make_fallback_source();
+        assert!(matches!(
+            fallback_decision(&result, &fallback),
+            FallbackDecision::TryFallback
+        ));
+    }
+
+    #[test]
+    fn test_fallback_decision_error_without_fallback_returns() {
+        let result: Result<InstallResult, ExtensionError> =
+            Err(ExtensionError::DownloadFailed("404 Not Found".to_string()));
+        let fallback = None;
+        assert!(matches!(
+            fallback_decision(&result, &fallback),
+            FallbackDecision::Return
+        ));
+    }
+
+    #[test]
+    fn test_combine_errors_includes_both_messages() {
+        let primary = ExtensionError::DownloadFailed("404 Not Found".to_string());
+        let fallback = ExtensionError::InstallFailed("cargo not found".to_string());
+        let combined = combine_install_errors(&primary, fallback);
+        let msg = combined.to_string();
+        assert!(msg.contains("404 Not Found"), "missing primary: {msg}");
+        assert!(msg.contains("cargo not found"), "missing fallback: {msg}");
+    }
+
+    #[test]
+    fn test_combine_errors_forwards_already_installed_from_fallback() {
+        let primary = ExtensionError::DownloadFailed("404".to_string());
+        let fallback = ExtensionError::AlreadyInstalled("test".to_string());
+        let combined = combine_install_errors(&primary, fallback);
+        assert!(
+            matches!(combined, ExtensionError::AlreadyInstalled(ref name) if name == "test"),
+            "Expected AlreadyInstalled, got: {combined:?}"
+        );
+    }
+
+    // === QA Plan P2 - 2.4: Extension registry collision tests (filesystem) ===
+
+    #[test]
+    fn test_tool_and_channel_paths_are_separate() {
+        // Verify that a WASM tool named "telegram" and a WASM channel named
+        // "telegram" use different filesystem paths and don't overwrite each other.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        let name = "telegram";
+        let tool_wasm = tools_dir.join(format!("{}.wasm", name));
+        let channel_wasm = channels_dir.join(format!("{}.wasm", name));
+
+        // Simulate installing both.
+        std::fs::write(&tool_wasm, b"tool-payload").unwrap();
+        std::fs::write(&channel_wasm, b"channel-payload").unwrap();
+
+        // Both files exist and contain distinct content.
+        assert!(tool_wasm.exists());
+        assert!(channel_wasm.exists());
+        assert_ne!(
+            std::fs::read(&tool_wasm).unwrap(),
+            std::fs::read(&channel_wasm).unwrap(),
+            "Tool and channel files must be independent"
+        );
+
+        // Removing one doesn't affect the other.
+        std::fs::remove_file(&tool_wasm).unwrap();
+        assert!(!tool_wasm.exists());
+        assert!(
+            channel_wasm.exists(),
+            "Removing tool must not affect channel"
+        );
+    }
+
+    #[test]
+    fn test_determine_kind_priority_tools_before_channels() {
+        // When a name exists in both tools and channels dirs,
+        // determine_installed_kind checks tools first (wasm_tools_dir).
+        // This test documents the priority order.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        let name = "ambiguous";
+        let tool_wasm = tools_dir.join(format!("{}.wasm", name));
+        let channel_wasm = channels_dir.join(format!("{}.wasm", name));
+
+        // Only channel exists → channel kind.
+        std::fs::write(&channel_wasm, b"channel").unwrap();
+        assert!(!tool_wasm.exists());
+        assert!(channel_wasm.exists());
+
+        // Both exist → tools dir checked first.
+        std::fs::write(&tool_wasm, b"tool").unwrap();
+        assert!(tool_wasm.exists());
+        assert!(channel_wasm.exists());
+        // This documents the determine_installed_kind priority:
+        // tools are checked before channels.
+
+        // Only tool exists → tool kind.
+        std::fs::remove_file(&channel_wasm).unwrap();
+        assert!(tool_wasm.exists());
+        assert!(!channel_wasm.exists());
+    }
+
+    #[test]
+    fn test_capabilities_files_also_separate() {
+        // capabilities.json files for tools and channels should also be separate.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        let name = "telegram";
+        let tool_cap = tools_dir.join(format!("{}.capabilities.json", name));
+        let channel_cap = channels_dir.join(format!("{}.capabilities.json", name));
+
+        let tool_caps = r#"{"required_secrets":["TELEGRAM_API_KEY"]}"#;
+        let channel_caps = r#"{"required_secrets":["TELEGRAM_BOT_TOKEN"]}"#;
+
+        std::fs::write(&tool_cap, tool_caps).unwrap();
+        std::fs::write(&channel_cap, channel_caps).unwrap();
+
+        // Both exist with distinct content.
+        assert_eq!(std::fs::read_to_string(&tool_cap).unwrap(), tool_caps);
+        assert_eq!(std::fs::read_to_string(&channel_cap).unwrap(), channel_caps);
     }
 }

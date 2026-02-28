@@ -68,6 +68,7 @@ pub struct AgentDeps {
     pub workspace: Option<Arc<Workspace>>,
     pub extension_manager: Option<Arc<ExtensionManager>>,
     pub skill_registry: Option<Arc<std::sync::RwLock<SkillRegistry>>>,
+    pub skill_catalog: Option<Arc<crate::skills::catalog::SkillCatalog>>,
     pub skills_config: SkillsConfig,
     pub hooks: Arc<HookRegistry>,
     /// Cost enforcement guardrails (daily budget, hourly rate limits).
@@ -172,6 +173,10 @@ impl Agent {
 
     pub(super) fn skill_registry(&self) -> Option<&Arc<std::sync::RwLock<SkillRegistry>>> {
         self.deps.skill_registry.as_ref()
+    }
+
+    pub(super) fn skill_catalog(&self) -> Option<&Arc<crate::skills::catalog::SkillCatalog>> {
+        self.deps.skill_catalog.as_ref()
     }
 
     /// Select active skills for a message using deterministic prefiltering.
@@ -408,7 +413,7 @@ impl Agent {
                     // Load initial event cache
                     engine.refresh_event_cache().await;
 
-                    // Spawn notification forwarder
+                    // Spawn notification forwarder (mirrors heartbeat pattern)
                     let channels = self.channels.clone();
                     tokio::spawn(async move {
                         while let Some(response) = notify_rx.recv().await {
@@ -418,14 +423,33 @@ impl Agent {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("default")
                                 .to_string();
-                            let results = channels.broadcast_all(&user, response).await;
-                            for (ch, result) in results {
-                                if let Err(e) = result {
-                                    tracing::warn!(
-                                        "Failed to broadcast routine notification to {}: {}",
-                                        ch,
-                                        e
-                                    );
+                            let notify_channel = response
+                                .metadata
+                                .get("notify_channel")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+
+                            // Try the configured channel first, fall back to
+                            // broadcasting on all channels.
+                            let targeted_ok = if let Some(ref channel) = notify_channel {
+                                channels
+                                    .broadcast(channel, &user, response.clone())
+                                    .await
+                                    .is_ok()
+                            } else {
+                                false
+                            };
+
+                            if !targeted_ok {
+                                let results = channels.broadcast_all(&user, response).await;
+                                for (ch, result) in results {
+                                    if let Err(e) = result {
+                                        tracing::warn!(
+                                            "Failed to broadcast routine notification to {}: {}",
+                                            ch,
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -583,6 +607,19 @@ impl Agent {
     }
 
     async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
+        // Set message tool context for this turn (current channel and target)
+        // For Signal, use signal_target from metadata (group:ID or phone number),
+        // otherwise fall back to user_id
+        let target = message
+            .metadata
+            .get("signal_target")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| message.user_id.clone());
+        self.tools()
+            .set_message_tool_context(Some(message.channel.clone()), Some(target))
+            .await;
+
         // Parse submission type first
         let mut submission = SubmissionParser::parse(&message.content);
 
@@ -680,6 +717,14 @@ impl Agent {
             Submission::Heartbeat => self.process_heartbeat().await,
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::Reasoning { arg } => self.process_reasoning(session, thread_id, arg).await,
+            Submission::JobStatus { job_id } => {
+                self.process_job_status(&message.user_id, job_id.as_deref())
+                    .await
+            }
+            Submission::JobCancel { job_id } => {
+                self.process_job_cancel(&message.user_id, &job_id).await
+            }
             Submission::Quit => return Ok(None),
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await

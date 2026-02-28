@@ -26,15 +26,21 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
 use crate::agent::SessionManager;
+use crate::agent::session::Turn;
+use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
+use crate::channels::web::handlers::skills::{
+    skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
+};
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
+use crate::channels::web::util::{build_turns_from_db_messages, truncate_preview};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, redaction::redact_sensitive_json};
 use crate::workspace::Workspace;
 
 /// Shared prompt queue: maps job IDs to pending follow-up prompts for Claude Code bridges.
@@ -155,30 +161,14 @@ pub struct GatewayState {
     pub cost_guard: Option<Arc<crate::agent::cost_guard::CostGuard>>,
     /// Server startup time for uptime calculation.
     pub startup_time: std::time::Instant,
+    /// Flag set when a restart has been requested via the API.
+    pub restart_requested: std::sync::atomic::AtomicBool,
 }
 
 /// Start the gateway HTTP server.
 ///
 /// Returns the actual bound `SocketAddr` (useful when binding to port 0).
-pub async fn start_server(
-    addr: SocketAddr,
-    state: Arc<GatewayState>,
-    auth_token: String,
-) -> Result<SocketAddr, crate::error::ChannelError> {
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        crate::error::ChannelError::StartupFailed {
-            name: "gateway".to_string(),
-            reason: format!("Failed to bind to {}: {}", addr, e),
-        }
-    })?;
-    let bound_addr =
-        listener
-            .local_addr()
-            .map_err(|e| crate::error::ChannelError::StartupFailed {
-                name: "gateway".to_string(),
-                reason: format!("Failed to get local addr: {}", e),
-            })?;
-
+fn build_gateway_router(addr: SocketAddr, state: Arc<GatewayState>, auth_token: String) -> Router {
     // Public routes (no auth)
     let public = Router::new().route("/api/health", get(health_handler));
 
@@ -235,6 +225,8 @@ pub async fn start_server(
             "/api/extensions/{name}/setup",
             get(extensions_setup_handler).post(extensions_setup_submit_handler),
         )
+        // Gateway management
+        .route("/api/gateway/restart", post(gateway_restart_handler))
         // Pairing
         .route("/api/pairing/{channel}", get(pairing_list_handler))
         .route(
@@ -291,6 +283,7 @@ pub async fn start_server(
         .route("/", get(index_handler))
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
+        .route("/dompurify.bundle.min.js", get(dompurify_bundle_handler))
         .route("/favicon.ico", get(favicon_handler));
 
     // Project file serving (behind auth to prevent unauthorized file access).
@@ -326,7 +319,7 @@ pub async fn start_server(
         ]))
         .allow_credentials(true);
 
-    let app = Router::new()
+    Router::new()
         .merge(public)
         .merge(statics)
         .merge(projects)
@@ -341,7 +334,29 @@ pub async fn start_server(
             header::X_FRAME_OPTIONS,
             header::HeaderValue::from_static("DENY"),
         ))
-        .with_state(state.clone());
+        .with_state(state)
+}
+
+pub async fn start_server(
+    addr: SocketAddr,
+    state: Arc<GatewayState>,
+    auth_token: String,
+) -> Result<SocketAddr, crate::error::ChannelError> {
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        crate::error::ChannelError::StartupFailed {
+            name: "gateway".to_string(),
+            reason: format!("Failed to bind to {}: {}", addr, e),
+        }
+    })?;
+    let bound_addr =
+        listener
+            .local_addr()
+            .map_err(|e| crate::error::ChannelError::StartupFailed {
+                name: "gateway".to_string(),
+                reason: format!("Failed to get local addr: {}", e),
+            })?;
+
+    let app = build_gateway_router(bound_addr, state.clone(), auth_token);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     *state.shutdown_tx.write().await = Some(shutdown_tx);
@@ -393,6 +408,16 @@ async fn js_handler() -> impl IntoResponse {
     )
 }
 
+async fn dompurify_bundle_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/dompurify.bundle.min.js"),
+    )
+}
+
 async fn favicon_handler() -> impl IntoResponse {
     (
         [
@@ -429,8 +454,10 @@ async fn chat_send_handler(
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
-        msg = msg.with_metadata(serde_json::json!({"thread_id": thread_id}));
     }
+
+    let metadata_thread_id = req.thread_id.clone().unwrap_or_else(|| msg.id.to_string());
+    msg = msg.with_metadata(serde_json::json!({"thread_id": metadata_thread_id}));
 
     let msg_id = msg.id;
 
@@ -498,6 +525,9 @@ async fn chat_approval_handler(
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
     }
+
+    let metadata_thread_id = req.thread_id.clone().unwrap_or_else(|| msg.id.to_string());
+    msg = msg.with_metadata(serde_json::json!({"thread_id": metadata_thread_id}));
 
     let msg_id = msg.id;
 
@@ -659,6 +689,43 @@ struct HistoryQuery {
     before: Option<String>,
 }
 
+fn turn_reasoning_from_in_memory(
+    session_id: Uuid,
+    thread_id: Uuid,
+    turn: &Turn,
+) -> Option<TurnReasoningInfo> {
+    if turn.tool_calls.is_empty() {
+        return None;
+    }
+
+    let tool_decisions: Vec<ToolDecisionInfo> = turn
+        .tool_calls
+        .iter()
+        .map(|tc| ToolDecisionInfo {
+            tool_call_id: tc.tool_call_id.clone(),
+            tool_name: tc.name.clone(),
+            rationale: tc.rationale.clone(),
+            parameters: redact_sensitive_json(&tc.parameters),
+            outcome: if tc.error.is_some() {
+                "error".to_string()
+            } else if tc.result.is_some() {
+                "success".to_string()
+            } else {
+                "pending".to_string()
+            },
+            parallel_group: tc.parallel_group,
+        })
+        .collect();
+
+    Some(TurnReasoningInfo {
+        session_id,
+        thread_id,
+        turn_number: turn.turn_number + 1,
+        narrative: turn.narrative.clone(),
+        tool_decisions,
+    })
+}
+
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<HistoryQuery>,
@@ -727,18 +794,19 @@ async fn chat_history_handler(
             turns,
             has_more,
             oldest_timestamp,
+            pending_approval: None,
         }));
     }
 
     // Try in-memory first (freshest data for active threads)
     if let Some(thread) = sess.threads.get(&thread_id)
-        && !thread.turns.is_empty()
+        && (!thread.turns.is_empty() || thread.pending_approval.is_some())
     {
         let turns: Vec<TurnInfo> = thread
             .turns
             .iter()
             .map(|t| TurnInfo {
-                turn_number: t.turn_number,
+                turn_number: t.turn_number + 1,
                 user_input: t.user_input.clone(),
                 response: t.response.clone(),
                 state: format!("{:?}", t.state),
@@ -751,16 +819,36 @@ async fn chat_history_handler(
                         name: tc.name.clone(),
                         has_result: tc.result.is_some(),
                         has_error: tc.error.is_some(),
+                        result_preview: tc.result.as_ref().map(|r| {
+                            let s = match r {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            truncate_preview(&s, 500)
+                        }),
+                        error: tc.error.clone(),
                     })
                     .collect(),
+                reasoning: turn_reasoning_from_in_memory(sess.id, thread_id, t),
             })
             .collect();
+
+        let pending_approval = thread
+            .pending_approval
+            .as_ref()
+            .map(|pa| PendingApprovalInfo {
+                request_id: pa.request_id.to_string(),
+                tool_name: pa.tool_name.clone(),
+                description: pa.description.clone(),
+                parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
+            });
 
         return Ok(Json(HistoryResponse {
             thread_id,
             turns,
             has_more: false,
             oldest_timestamp: None,
+            pending_approval,
         }));
     }
 
@@ -779,6 +867,7 @@ async fn chat_history_handler(
                 turns,
                 has_more,
                 oldest_timestamp,
+                pending_approval: None,
             }));
         }
     }
@@ -789,47 +878,8 @@ async fn chat_history_handler(
         turns: Vec::new(),
         has_more: false,
         oldest_timestamp: None,
+        pending_approval: None,
     }))
-}
-
-/// Build TurnInfo pairs from flat DB messages (alternating user/assistant).
-fn build_turns_from_db_messages(messages: &[crate::history::ConversationMessage]) -> Vec<TurnInfo> {
-    let mut turns = Vec::new();
-    let mut turn_number = 0;
-    let mut iter = messages.iter().peekable();
-
-    while let Some(msg) = iter.next() {
-        if msg.role == "user" {
-            let mut turn = TurnInfo {
-                turn_number,
-                user_input: msg.content.clone(),
-                response: None,
-                state: "Completed".to_string(),
-                started_at: msg.created_at.to_rfc3339(),
-                completed_at: None,
-                tool_calls: Vec::new(),
-            };
-
-            // Check if next message is an assistant response
-            if let Some(next) = iter.peek()
-                && next.role == "assistant"
-            {
-                let assistant_msg = iter.next().expect("peeked");
-                turn.response = Some(assistant_msg.content.clone());
-                turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
-            }
-
-            // Incomplete turn (user message without response)
-            if turn.response.is_none() {
-                turn.state = "Failed".to_string();
-            }
-
-            turns.push(turn);
-            turn_number += 1;
-        }
-    }
-
-    turns
 }
 
 async fn chat_threads_handler(
@@ -862,7 +912,7 @@ async fn chat_threads_handler(
                 let info = ThreadInfo {
                     id: s.id,
                     state: "Idle".to_string(),
-                    turn_count: (s.message_count / 2).max(0) as usize,
+                    turn_count: s.message_count.max(0) as usize,
                     created_at: s.started_at.to_rfc3339(),
                     updated_at: s.last_activity.to_rfc3339(),
                     title: s.title.clone(),
@@ -1719,17 +1769,46 @@ async fn extensions_list_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let pairing_store = crate::pairing::PairingStore::new();
     let extensions = installed
         .into_iter()
-        .map(|ext| ExtensionInfo {
-            name: ext.name,
-            kind: ext.kind.to_string(),
-            description: ext.description,
-            url: ext.url,
-            authenticated: ext.authenticated,
-            active: ext.active,
-            tools: ext.tools,
-            needs_setup: ext.needs_setup,
+        .map(|ext| {
+            let activation_status = if ext.kind == crate::extensions::ExtensionKind::WasmChannel {
+                Some(if ext.activation_error.is_some() {
+                    "failed".to_string()
+                } else if !ext.authenticated {
+                    // No credentials configured yet.
+                    "installed".to_string()
+                } else if ext.active && ext.name == "telegram" {
+                    // Telegram: check pairing status (end-to-end setup via web UI).
+                    let has_paired = pairing_store
+                        .read_allow_from(&ext.name)
+                        .map(|list| !list.is_empty())
+                        .unwrap_or(false);
+                    if has_paired {
+                        "active".to_string()
+                    } else {
+                        "pairing".to_string()
+                    }
+                } else {
+                    // Authenticated but not fully active (or non-Telegram).
+                    "configured".to_string()
+                })
+            } else {
+                None
+            };
+            ExtensionInfo {
+                name: ext.name,
+                kind: ext.kind.to_string(),
+                description: ext.description,
+                url: ext.url,
+                authenticated: ext.authenticated,
+                active: ext.active,
+                tools: ext.tools,
+                needs_setup: ext.needs_setup,
+                activation_status,
+                activation_error: ext.activation_error,
+            }
         })
         .collect();
 
@@ -1885,11 +1964,7 @@ async fn serve_project_file(project_id: &str, path: &str) -> axum::response::Res
         return (StatusCode::BAD_REQUEST, "Invalid project ID").into_response();
     }
 
-    let base = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw")
-        .join("projects")
-        .join(project_id);
+    let base = ironclaw_base_dir().join("projects").join(project_id);
 
     let file_path = base.join(path);
 
@@ -2034,9 +2109,42 @@ async fn extensions_setup_submit_handler(
     ))?;
 
     match ext_mgr.save_setup_secrets(&name, &req.secrets).await {
-        Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Ok(result) => {
+            let mut resp = ActionResponse::ok(result.message);
+            resp.activated = Some(result.activated);
+            if !result.activated {
+                resp.needs_restart = Some(true);
+            }
+            Ok(Json(resp))
+        }
         Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }
+}
+
+// --- Gateway management handlers ---
+
+async fn gateway_restart_handler(State(state): State<Arc<GatewayState>>) -> Json<ActionResponse> {
+    // Idempotency guard: only allow one restart at a time.
+    if state
+        .restart_requested
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Json(ActionResponse::ok("Restart already in progress"));
+    }
+
+    // Take the shutdown sender and trigger graceful shutdown.
+    if let Some(tx) = state.shutdown_tx.write().await.take() {
+        let _ = tx.send(());
+        tracing::info!("Gateway restart requested via API");
+    }
+
+    Json(ActionResponse::ok("Restarting..."))
 }
 
 // --- Pairing handlers ---
@@ -2086,253 +2194,6 @@ async fn pairing_approve_handler(
     }
 }
 
-// --- Skills handlers ---
-
-async fn skills_list_handler(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<super::types::SkillListResponse>, (StatusCode, String)> {
-    let registry = state.skill_registry.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Skills system not enabled".to_string(),
-    ))?;
-
-    let guard = registry.read().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Skill registry lock poisoned: {}", e),
-        )
-    })?;
-
-    let skills: Vec<super::types::SkillInfo> = guard
-        .skills()
-        .iter()
-        .map(|s| super::types::SkillInfo {
-            name: s.manifest.name.clone(),
-            description: s.manifest.description.clone(),
-            version: s.manifest.version.clone(),
-            trust: s.trust.to_string(),
-            source: format!("{:?}", s.source),
-            keywords: s.manifest.activation.keywords.clone(),
-        })
-        .collect();
-
-    let count = skills.len();
-    Ok(Json(super::types::SkillListResponse { skills, count }))
-}
-
-async fn skills_search_handler(
-    State(state): State<Arc<GatewayState>>,
-    Json(req): Json<super::types::SkillSearchRequest>,
-) -> Result<Json<super::types::SkillSearchResponse>, (StatusCode, String)> {
-    let registry = state.skill_registry.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Skills system not enabled".to_string(),
-    ))?;
-
-    let catalog = state.skill_catalog.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Skill catalog not available".to_string(),
-    ))?;
-
-    // Search ClawHub catalog
-    let catalog_results = catalog.search(&req.query).await;
-    let catalog_json: Vec<serde_json::Value> = catalog_results
-        .into_iter()
-        .map(|e| {
-            serde_json::json!({
-                "slug": e.slug,
-                "name": e.name,
-                "description": e.description,
-                "version": e.version,
-                "score": e.score,
-            })
-        })
-        .collect();
-
-    // Search local skills
-    let query_lower = req.query.to_lowercase();
-    let installed: Vec<super::types::SkillInfo> = {
-        let guard = registry.read().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Skill registry lock poisoned: {}", e),
-            )
-        })?;
-        guard
-            .skills()
-            .iter()
-            .filter(|s| {
-                s.manifest.name.to_lowercase().contains(&query_lower)
-                    || s.manifest.description.to_lowercase().contains(&query_lower)
-            })
-            .map(|s| super::types::SkillInfo {
-                name: s.manifest.name.clone(),
-                description: s.manifest.description.clone(),
-                version: s.manifest.version.clone(),
-                trust: s.trust.to_string(),
-                source: format!("{:?}", s.source),
-                keywords: s.manifest.activation.keywords.clone(),
-            })
-            .collect()
-    };
-
-    Ok(Json(super::types::SkillSearchResponse {
-        catalog: catalog_json,
-        installed,
-        registry_url: catalog.registry_url().to_string(),
-    }))
-}
-
-async fn skills_install_handler(
-    State(state): State<Arc<GatewayState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<super::types::SkillInstallRequest>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    // Require explicit confirmation header to prevent accidental installs.
-    // Chat tools have requires_approval(); this is the equivalent for the web API.
-    if headers
-        .get("x-confirm-action")
-        .and_then(|v| v.to_str().ok())
-        != Some("true")
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Skill install requires X-Confirm-Action: true header".to_string(),
-        ));
-    }
-
-    let registry = state.skill_registry.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Skills system not enabled".to_string(),
-    ))?;
-
-    let content = if let Some(ref raw) = req.content {
-        raw.clone()
-    } else if let Some(ref url) = req.url {
-        // Fetch from explicit URL (with SSRF protection)
-        crate::tools::builtin::skill_tools::fetch_skill_content(url)
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-    } else if let Some(ref catalog) = state.skill_catalog {
-        let url = crate::skills::catalog::skill_download_url(catalog.registry_url(), &req.name);
-        crate::tools::builtin::skill_tools::fetch_skill_content(&url)
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?
-    } else {
-        return Ok(Json(ActionResponse::fail(
-            "Provide 'content' or 'url' to install a skill".to_string(),
-        )));
-    };
-
-    // Parse, check duplicates, and get user_dir under a brief read lock.
-    let (user_dir, skill_name_from_parse) = {
-        let guard = registry.read().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Skill registry lock poisoned: {}", e),
-            )
-        })?;
-
-        let normalized = crate::skills::normalize_line_endings(&content);
-        let parsed = crate::skills::parser::parse_skill_md(&normalized)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        let skill_name = parsed.manifest.name.clone();
-
-        if guard.has(&skill_name) {
-            return Ok(Json(ActionResponse::fail(format!(
-                "Skill '{}' already exists",
-                skill_name
-            ))));
-        }
-
-        (guard.user_dir().to_path_buf(), skill_name)
-    };
-
-    // Perform async I/O (write to disk, load) with no lock held.
-    let normalized = crate::skills::normalize_line_endings(&content);
-    let (skill_name, loaded_skill) =
-        crate::skills::registry::SkillRegistry::prepare_install_to_disk(
-            &user_dir,
-            &skill_name_from_parse,
-            &normalized,
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Commit: brief write lock for in-memory addition
-    let mut guard = registry.write().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Skill registry lock poisoned: {}", e),
-        )
-    })?;
-
-    match guard.commit_install(&skill_name, loaded_skill) {
-        Ok(()) => Ok(Json(ActionResponse::ok(format!(
-            "Skill '{}' installed",
-            skill_name
-        )))),
-        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
-    }
-}
-
-async fn skills_remove_handler(
-    State(state): State<Arc<GatewayState>>,
-    headers: axum::http::HeaderMap,
-    Path(name): Path<String>,
-) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    // Require explicit confirmation header to prevent accidental removals.
-    if headers
-        .get("x-confirm-action")
-        .and_then(|v| v.to_str().ok())
-        != Some("true")
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Skill removal requires X-Confirm-Action: true header".to_string(),
-        ));
-    }
-
-    let registry = state.skill_registry.as_ref().ok_or((
-        StatusCode::NOT_IMPLEMENTED,
-        "Skills system not enabled".to_string(),
-    ))?;
-
-    // Validate removal under a brief read lock
-    let skill_path = {
-        let guard = registry.read().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Skill registry lock poisoned: {}", e),
-            )
-        })?;
-        guard
-            .validate_remove(&name)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-    };
-
-    // Delete files from disk (async I/O, no lock held)
-    crate::skills::registry::SkillRegistry::delete_skill_files(&skill_path)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Remove from in-memory registry under a brief write lock
-    let mut guard = registry.write().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Skill registry lock poisoned: {}", e),
-        )
-    })?;
-
-    match guard.commit_remove(&name) {
-        Ok(()) => Ok(Json(ActionResponse::ok(format!(
-            "Skill '{}' removed",
-            name
-        )))),
-        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
-    }
-}
-
 // --- Routines handlers ---
 
 async fn routines_list_handler(
@@ -2344,7 +2205,7 @@ async fn routines_list_handler(
     ))?;
 
     let routines = store
-        .list_routines(&state.user_id)
+        .list_all_routines()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -2362,7 +2223,7 @@ async fn routines_summary_handler(
     ))?;
 
     let routines = store
-        .list_routines(&state.user_id)
+        .list_all_routines()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -2841,6 +2702,39 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    #[test]
+    fn test_turn_reasoning_from_in_memory() {
+        let session_id = Uuid::new_v4();
+        let thread_id = Uuid::new_v4();
+        let mut turn = crate::agent::session::Turn::new(0, "hello");
+        turn.set_narrative("Inspecting prior context");
+        turn.record_tool_call(
+            "memory_search",
+            serde_json::json!({"query": "context"}),
+            "find prior decisions".to_string(),
+            Some(0),
+        );
+        turn.record_tool_result(serde_json::json!("ok"));
+
+        let reasoning = turn_reasoning_from_in_memory(session_id, thread_id, &turn)
+            .expect("reasoning should exist");
+        assert_eq!(reasoning.session_id, session_id);
+        assert_eq!(reasoning.thread_id, thread_id);
+        assert_eq!(reasoning.turn_number, 1);
+        assert_eq!(
+            reasoning.narrative.as_deref(),
+            Some("Inspecting prior context")
+        );
+        assert_eq!(reasoning.tool_decisions.len(), 1);
+        assert_eq!(reasoning.tool_decisions[0].tool_call_id, None);
+        assert_eq!(reasoning.tool_decisions[0].tool_name, "memory_search");
+        assert_eq!(reasoning.tool_decisions[0].parallel_group, Some(0));
+    }
 
     #[test]
     fn test_build_turns_from_db_messages_complete() {
@@ -2874,9 +2768,11 @@ mod tests {
 
         let turns = build_turns_from_db_messages(&messages);
         assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_number, 1);
         assert_eq!(turns[0].user_input, "Hello");
         assert_eq!(turns[0].response.as_deref(), Some("Hi there!"));
         assert_eq!(turns[0].state, "Completed");
+        assert_eq!(turns[1].turn_number, 2);
         assert_eq!(turns[1].user_input, "How are you?");
         assert_eq!(turns[1].response.as_deref(), Some("Doing well!"));
     }
@@ -2907,6 +2803,8 @@ mod tests {
 
         let turns = build_turns_from_db_messages(&messages);
         assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_number, 1);
+        assert_eq!(turns[1].turn_number, 2);
         assert_eq!(turns[1].user_input, "Lost message");
         assert!(turns[1].response.is_none());
         assert_eq!(turns[1].state, "Failed");
@@ -2916,5 +2814,112 @@ mod tests {
     fn test_build_turns_from_db_messages_empty() {
         let turns = build_turns_from_db_messages(&[]);
         assert!(turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_send_handler_attaches_metadata_thread_id() {
+        let (agent_tx, mut agent_rx) = mpsc::channel(8);
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(Some(agent_tx)),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let app = build_gateway_router(
+            "127.0.0.1:3001".parse().expect("socket addr"),
+            state,
+            "test-token".to_string(),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/chat/send")
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"content":"hello","thread_id":"thread-42"}).to_string(),
+            ))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let incoming = agent_rx.recv().await.expect("incoming message");
+        assert_eq!(incoming.metadata["thread_id"], "thread-42");
+    }
+
+    #[tokio::test]
+    async fn test_chat_approval_handler_attaches_metadata_thread_id() {
+        let (agent_tx, mut agent_rx) = mpsc::channel(8);
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(Some(agent_tx)),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: "test-user".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let app = build_gateway_router(
+            "127.0.0.1:3001".parse().expect("socket addr"),
+            state,
+            "test-token".to_string(),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/chat/approval")
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "request_id": Uuid::new_v4().to_string(),
+                    "action": "approve",
+                    "thread_id": "thread-7"
+                })
+                .to_string(),
+            ))
+            .expect("request");
+
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let incoming = agent_rx.recv().await.expect("incoming message");
+        assert_eq!(incoming.metadata["thread_id"], "thread-7");
     }
 }

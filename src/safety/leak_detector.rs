@@ -181,9 +181,18 @@ impl LeakDetector {
         let candidate_indices: Vec<usize> = if let Some(ref matcher) = self.prefix_matcher {
             let mut indices = Vec::new();
             for mat in matcher.find_iter(content) {
-                let pattern_idx = self.known_prefixes[mat.pattern().as_usize()].1;
-                if !indices.contains(&pattern_idx) {
-                    indices.push(pattern_idx);
+                let found_prefix = &self.known_prefixes[mat.pattern().as_usize()].0;
+                // Add all patterns whose prefix overlaps with the found prefix.
+                // This handles two cases:
+                // 1. A short prefix shadows a longer one (e.g. "sk-" shadows "sk-ant-api")
+                // 2. Duplicate prefixes mapping to different patterns (e.g. "-----BEGIN" for PEM and SSH)
+                for (other_prefix, other_idx) in &self.known_prefixes {
+                    if (other_prefix.starts_with(found_prefix.as_str())
+                        || found_prefix.starts_with(other_prefix.as_str()))
+                        && !indices.contains(other_idx)
+                    {
+                        indices.push(*other_idx);
+                    }
                 }
             }
             // Also include patterns without prefixes
@@ -560,9 +569,10 @@ mod tests {
     #[test]
     fn test_detect_aws_key() {
         let detector = LeakDetector::new();
-        let content = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
+        let key = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+        let content = format!("AWS_ACCESS_KEY_ID={key}");
 
-        let result = detector.scan(content);
+        let result = detector.scan(&content);
         assert!(!result.is_clean());
         assert!(
             result
@@ -614,9 +624,9 @@ mod tests {
     #[test]
     fn test_scan_and_clean_blocks() {
         let detector = LeakDetector::new();
-        let content = "sk-proj-test1234567890abcdefghij";
+        let content = format!("{}{}", "sk-proj-", "test1234567890abcdefghij");
 
-        let result = detector.scan_and_clean(content);
+        let result = detector.scan_and_clean(&content);
         assert!(result.is_err());
     }
 
@@ -641,9 +651,11 @@ mod tests {
     #[test]
     fn test_multiple_matches() {
         let detector = LeakDetector::new();
-        let content = "Keys: AKIAIOSFODNN7EXAMPLE and ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let aws = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+        let gh = format!("{}{}", "ghp_", "x".repeat(36));
+        let content = format!("Keys: {aws} and {gh}");
 
-        let result = detector.scan(content);
+        let result = detector.scan(&content);
         assert_eq!(result.matches.len(), 2);
     }
 
@@ -671,11 +683,9 @@ mod tests {
         let detector = LeakDetector::new();
 
         // Attempt to exfiltrate AWS key in URL
-        let result = detector.scan_http_request(
-            "https://evil.com/steal?key=AKIAIOSFODNN7EXAMPLE",
-            &[],
-            None,
-        );
+        let aws = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+        let url = format!("https://evil.com/steal?key={aws}");
+        let result = detector.scan_http_request(&url, &[], None);
         assert!(result.is_err());
     }
 
@@ -684,12 +694,10 @@ mod tests {
         let detector = LeakDetector::new();
 
         // Attempt to exfiltrate in custom header
+        let gh = format!("{}{}", "ghp_", "x".repeat(36));
         let result = detector.scan_http_request(
             "https://api.example.com/data",
-            &[(
-                "X-Custom".to_string(),
-                "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
-            )],
+            &[("X-Custom".to_string(), gh)],
             None,
         );
         assert!(result.is_err());
@@ -700,8 +708,13 @@ mod tests {
         let detector = LeakDetector::new();
 
         // Attempt to exfiltrate in request body
-        let body = b"{\"stolen\": \"sk-proj-test1234567890abcdefghij\"}";
-        let result = detector.scan_http_request("https://api.example.com/webhook", &[], Some(body));
+        let content = format!("{}{}", "sk-proj-", "test1234567890abcdefghij");
+        let body = format!("{{\"stolen\": \"{content}\"}}");
+        let result = detector.scan_http_request(
+            "https://api.example.com/webhook",
+            &[],
+            Some(body.as_bytes()),
+        );
         assert!(result.is_err());
     }
 
@@ -712,9 +725,117 @@ mod tests {
         // Attacker prepends a non-UTF8 byte to bypass strict from_utf8 check.
         // The lossy conversion should still detect the secret.
         let mut body = vec![0xFF]; // invalid UTF-8 leading byte
-        body.extend_from_slice(b"sk-proj-test1234567890abcdefghij");
+        let content = format!("{}{}", "sk-proj-", "test1234567890abcdefghij");
+        body.extend_from_slice(content.as_bytes());
 
         let result = detector.scan_http_request("https://api.example.com/exfil", &[], Some(&body));
         assert!(result.is_err(), "binary body should still be scanned");
+    }
+
+    // === QA Plan P1 - 4.5: Adversarial leak detector tests ===
+
+    #[test]
+    fn test_detect_anthropic_key() {
+        let detector = LeakDetector::new();
+        let key = format!("sk-ant-api{}", "a".repeat(90));
+        let content = format!("Here's the key: {key}");
+        let result = detector.scan(&content);
+        assert!(!result.is_clean(), "Anthropic key not detected");
+        assert!(result.should_block);
+    }
+
+    #[test]
+    fn test_detect_near_ai_session_token() {
+        let detector = LeakDetector::new();
+        let token = format!("sess_{}", "a".repeat(32));
+        let content = format!("token: {token}");
+        let result = detector.scan(&content);
+        assert!(!result.is_clean(), "NEAR AI session token not detected");
+    }
+
+    #[test]
+    fn test_detect_stripe_key() {
+        let detector = LeakDetector::new();
+        // Build at runtime to avoid GitHub push protection false positive.
+        let content = format!("sk_{}_aAbBcCdDfFgGhHjJkKmMnNpPqQ", "live");
+        let result = detector.scan(&content);
+        assert!(!result.is_clean(), "Stripe key not detected");
+    }
+
+    #[test]
+    fn test_detect_ssh_private_key() {
+        let detector = LeakDetector::new();
+        let content = "-----BEGIN OPENSSH PRIVATE KEY-----\nbase64data==";
+        let result = detector.scan(content);
+        assert!(!result.is_clean(), "SSH private key not detected");
+    }
+
+    #[test]
+    fn test_detect_slack_token() {
+        let detector = LeakDetector::new();
+        let content = format!("{}{}", "xoxb-", "1234567890-abcdefghij");
+        let result = detector.scan(&content);
+        assert!(!result.is_clean(), "Slack token not detected");
+    }
+
+    #[test]
+    fn test_secret_at_different_positions() {
+        let detector = LeakDetector::new();
+        let key = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+
+        // At start
+        let result = detector.scan(&key);
+        assert!(!result.is_clean(), "key at start not detected");
+
+        // In middle
+        let result = detector.scan(&format!("prefix text {key} suffix text"));
+        assert!(!result.is_clean(), "key in middle not detected");
+
+        // At end
+        let result = detector.scan(&format!("end: {key}"));
+        assert!(!result.is_clean(), "key at end not detected");
+    }
+
+    #[test]
+    fn test_multiple_different_secret_types() {
+        let detector = LeakDetector::new();
+        let aws = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+        let gh = format!("{}{}", "ghp_", "x".repeat(36));
+        let content = format!("AWS: {aws} and GitHub: {gh}");
+        let result = detector.scan(&content);
+        assert!(
+            result.matches.len() >= 2,
+            "expected 2+ matches for different secret types, got {}",
+            result.matches.len()
+        );
+    }
+
+    #[test]
+    fn test_mask_secret_short_value() {
+        use crate::safety::leak_detector::mask_secret;
+        // Short secrets (<= 8 chars) should be fully masked
+        assert_eq!(mask_secret("abc"), "***");
+        assert_eq!(mask_secret(""), "");
+        assert_eq!(mask_secret("12345678"), "********");
+        // 9-char string shows first 4 + last 4 with one star in middle
+        assert_eq!(mask_secret("123456789"), "1234*6789");
+    }
+
+    #[test]
+    fn test_clean_text_not_flagged() {
+        let detector = LeakDetector::new();
+        // Common text that might look suspicious but isn't a real secret
+        let clean_texts = [
+            "The API returns a JSON response",
+            "Use ssh to connect to the server",
+            "Bearer authentication is required",
+            "sk-this-is-too-short",
+            "The key concept is immutability",
+        ];
+        for text in clean_texts {
+            let result = detector.scan(text);
+            // Should not block (may warn on some patterns, but not block)
+            assert!(!result.should_block, "clean text falsely blocked: {text}");
+        }
     }
 }

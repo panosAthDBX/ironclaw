@@ -9,7 +9,7 @@ use ironclaw::{
     agent::{Agent, AgentDeps},
     app::{AppBuilder, AppBuilderFlags},
     channels::{
-        ChannelManager, GatewayChannel, HttpChannel, ReplChannel, WebhookServer,
+        ChannelManager, GatewayChannel, HttpChannel, ReplChannel, SignalChannel, WebhookServer,
         WebhookServerConfig,
         wasm::{
             RegisteredEndpoint, SharedWasmChannel, WasmChannelLoader, WasmChannelRouter,
@@ -220,9 +220,35 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Orchestrator / container job manager ────────────────────────────
 
+    // Proactive Docker detection
+    let docker_status = if config.sandbox.enabled {
+        let detection = ironclaw::sandbox::check_docker().await;
+        match detection.status {
+            ironclaw::sandbox::DockerStatus::Available => {
+                tracing::info!("Docker is available");
+            }
+            ironclaw::sandbox::DockerStatus::NotInstalled => {
+                tracing::warn!(
+                    "Docker is not installed -- sandbox disabled for this session. {}",
+                    detection.platform.install_hint()
+                );
+            }
+            ironclaw::sandbox::DockerStatus::NotRunning => {
+                tracing::warn!(
+                    "Docker is installed but not running -- sandbox disabled for this session. {}",
+                    detection.platform.start_hint()
+                );
+            }
+            ironclaw::sandbox::DockerStatus::Disabled => {}
+        }
+        detection.status
+    } else {
+        ironclaw::sandbox::DockerStatus::Disabled
+    };
+
     let job_event_tx: Option<
         tokio::sync::broadcast::Sender<(uuid::Uuid, ironclaw::channels::web::types::SseEvent)>,
-    > = if config.sandbox.enabled {
+    > = if config.sandbox.enabled && docker_status.is_ok() {
         let (tx, _) = tokio::sync::broadcast::channel(256);
         Some(tx)
     } else {
@@ -233,51 +259,53 @@ async fn main() -> anyhow::Result<()> {
         std::collections::VecDeque<ironclaw::orchestrator::api::PendingPrompt>,
     >::new()));
 
-    let container_job_manager: Option<Arc<ContainerJobManager>> = if config.sandbox.enabled {
-        let token_store = TokenStore::new();
-        let job_config = ContainerJobConfig {
-            image: config.sandbox.image.clone(),
-            memory_limit_mb: config.sandbox.memory_limit_mb,
-            cpu_shares: config.sandbox.cpu_shares,
-            orchestrator_port: 50051,
-            claude_code_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
-            claude_code_oauth_token: ironclaw::config::ClaudeCodeConfig::extract_oauth_token(),
-            claude_code_model: config.claude_code.model.clone(),
-            claude_code_max_turns: config.claude_code.max_turns,
-            claude_code_memory_limit_mb: config.claude_code.memory_limit_mb,
-            claude_code_allowed_tools: config.claude_code.allowed_tools.clone(),
-        };
-        let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
+    let container_job_manager: Option<Arc<ContainerJobManager>> =
+        if config.sandbox.enabled && docker_status.is_ok() {
+            let token_store = TokenStore::new();
+            let job_config = ContainerJobConfig {
+                image: config.sandbox.image.clone(),
+                memory_limit_mb: config.sandbox.memory_limit_mb,
+                cpu_shares: config.sandbox.cpu_shares,
+                orchestrator_port: 50051,
+                claude_code_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+                claude_code_oauth_token: ironclaw::config::ClaudeCodeConfig::extract_oauth_token(),
+                claude_code_model: config.claude_code.model.clone(),
+                claude_code_max_turns: config.claude_code.max_turns,
+                claude_code_memory_limit_mb: config.claude_code.memory_limit_mb,
+                claude_code_allowed_tools: config.claude_code.allowed_tools.clone(),
+            };
+            let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
 
-        // Start the orchestrator internal API in the background
-        let orchestrator_state = OrchestratorState {
-            llm: components.llm.clone(),
-            job_manager: Arc::clone(&jm),
-            token_store,
-            job_event_tx: job_event_tx.clone(),
-            prompt_queue: Arc::clone(&prompt_queue),
-            store: components.db.clone(),
-            secrets_store: components.secrets_store.clone(),
-            user_id: "default".to_string(),
-        };
+            // Start the orchestrator internal API in the background
+            let orchestrator_state = OrchestratorState {
+                llm: components.llm.clone(),
+                job_manager: Arc::clone(&jm),
+                token_store,
+                job_event_tx: job_event_tx.clone(),
+                prompt_queue: Arc::clone(&prompt_queue),
+                store: components.db.clone(),
+                secrets_store: components.secrets_store.clone(),
+                safety: components.safety.clone(),
+                user_id: "default".to_string(),
+            };
 
-        tokio::spawn(async move {
-            if let Err(e) = OrchestratorApi::start(orchestrator_state, 50051).await {
-                tracing::error!("Orchestrator API failed: {}", e);
+            tokio::spawn(async move {
+                if let Err(e) = OrchestratorApi::start(orchestrator_state, 50051).await {
+                    tracing::error!("Orchestrator API failed: {}", e);
+                }
+            });
+
+            if config.claude_code.enabled {
+                tracing::info!(
+                    "Claude Code sandbox mode available (model: {}, max_turns: {})",
+                    config.claude_code.model,
+                    config.claude_code.max_turns
+                );
             }
-        });
-
-        if config.claude_code.enabled {
-            tracing::info!(
-                "Claude Code sandbox mode available (model: {}, max_turns: {})",
-                config.claude_code.model,
-                config.claude_code.max_turns
-            );
-        }
-        Some(jm)
-    } else {
-        None
-    };
+            Some(jm)
+        } else {
+            None
+        };
 
     // ── Channel setup ──────────────────────────────────────────────────
 
@@ -321,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
             &config,
             &components.secrets_store,
             components.extension_manager.as_ref(),
+            components.db.as_ref(),
         )
         .await;
 
@@ -338,6 +367,25 @@ async fn main() -> anyhow::Result<()> {
             if let Some(routes) = result.webhook_routes {
                 webhook_routes.push(routes);
             }
+        }
+    }
+
+    // Add Signal channel if configured and not CLI-only mode.
+    if !cli.cli_only
+        && let Some(ref signal_config) = config.channels.signal
+    {
+        let signal_channel = SignalChannel::new(signal_config.clone())?;
+        channel_names.push("signal".to_string());
+        channels.add(Box::new(signal_channel)).await;
+        let safe_url = SignalChannel::redact_url(&signal_config.http_url);
+        tracing::info!(
+            url = %safe_url,
+            "Signal channel enabled"
+        );
+        if signal_config.allow_from.is_empty() {
+            tracing::warn!(
+                "Signal channel has empty allow_from list - ALL messages will be DENIED."
+            );
         }
     }
 
@@ -428,6 +476,11 @@ async fn main() -> anyhow::Result<()> {
     // ── Gateway channel ────────────────────────────────────────────────
 
     let mut gateway_url: Option<String> = None;
+    let mut sse_sender: Option<
+        tokio::sync::broadcast::Sender<ironclaw::channels::web::types::SseEvent>,
+    > = None;
+    let mut gateway_state: Option<std::sync::Arc<ironclaw::channels::web::server::GatewayState>> =
+        None;
     if let Some(ref gw_config) = config.channels.gateway {
         let mut gw =
             GatewayChannel::new(gw_config.clone()).with_llm_provider(Arc::clone(&components.llm));
@@ -480,6 +533,12 @@ async fn main() -> anyhow::Result<()> {
 
         tracing::info!("Web UI: http://{}:{}/", gw_config.host, gw_config.port);
 
+        // Capture SSE sender before moving gw into channels.
+        // IMPORTANT: This must come after all `with_*` calls since `rebuild_state`
+        // creates a new SseManager, which would orphan this sender.
+        sse_sender = Some(gw.state().sse.sender());
+        gateway_state = Some(Arc::clone(gw.state()));
+
         channel_names.push("gateway".to_string());
         channels.add(Box::new(gw)).await;
     }
@@ -517,8 +576,10 @@ async fn main() -> anyhow::Result<()> {
             heartbeat_enabled: config.heartbeat.enabled,
             heartbeat_interval_secs: config.heartbeat.interval_secs,
             sandbox_enabled: config.sandbox.enabled,
+            docker_status,
             claude_code_enabled: config.claude_code.enabled,
             routines_enabled: config.routines.enabled,
+            skills_enabled: config.skills.enabled,
             channels: channel_names,
             tunnel_url: active_tunnel
                 .as_ref()
@@ -533,10 +594,17 @@ async fn main() -> anyhow::Result<()> {
 
     let channels = Arc::new(channels);
 
+    // Register message tool for sending messages to connected channels
+    components
+        .tools
+        .register_message_tools(Arc::clone(&channels))
+        .await;
+
     // Wire up channel runtime for hot-activation of WASM channels.
     if let Some(ref ext_mgr) = components.extension_manager
         && let Some((rt, ps, router)) = wasm_channel_runtime_state.take()
     {
+        ext_mgr.set_active_channels(loaded_wasm_channel_names).await;
         ext_mgr
             .set_channel_runtime(
                 Arc::clone(&channels),
@@ -549,6 +617,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Channel runtime wired into extension manager for hot-activation");
     }
 
+    // Wire SSE sender into extension manager for broadcasting status events.
+    if let Some(ref ext_mgr) = components.extension_manager
+        && let Some(sender) = sse_sender
+    {
+        ext_mgr.set_sse_sender(sender).await;
+    }
+
     let deps = AgentDeps {
         store: components.db,
         llm: components.llm,
@@ -558,6 +633,7 @@ async fn main() -> anyhow::Result<()> {
         workspace: components.workspace,
         extension_manager: components.extension_manager,
         skill_registry: components.skill_registry,
+        skill_catalog: components.skill_catalog,
         skills_config: config.skills.clone(),
         hooks: components.hooks,
         cost_guard: components.cost_guard,
@@ -590,6 +666,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("Agent shutdown complete");
+
+    // Check if a restart was requested via the gateway API.
+    if let Some(ref gw_state) = gateway_state
+        && gw_state
+            .restart_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!("Restarting IronClaw (exit code 75)...");
+        std::process::exit(75);
+    }
+
     Ok(())
 }
 
@@ -778,6 +865,7 @@ async fn setup_wasm_channels(
     config: &ironclaw::config::Config,
     secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
     extension_manager: Option<&Arc<ironclaw::extensions::ExtensionManager>>,
+    database: Option<&Arc<dyn ironclaw::db::Database>>,
 ) -> Option<WasmChannelSetup> {
     let runtime = match WasmChannelRuntime::new(WasmChannelRuntimeConfig::default()) {
         Ok(r) => Arc::new(r),
@@ -788,7 +876,13 @@ async fn setup_wasm_channels(
     };
 
     let pairing_store = Arc::new(PairingStore::new());
-    let loader = WasmChannelLoader::new(Arc::clone(&runtime), Arc::clone(&pairing_store));
+    let settings_store: Option<Arc<dyn ironclaw::db::SettingsStore>> =
+        database.map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>);
+    let loader = WasmChannelLoader::new(
+        Arc::clone(&runtime),
+        Arc::clone(&pairing_store),
+        settings_store,
+    );
 
     let results = match loader
         .load_from_dir(&config.channels.wasm_channels_dir)
@@ -802,7 +896,6 @@ async fn setup_wasm_channels(
     };
 
     let wasm_router = Arc::new(WasmChannelRouter::new());
-    let mut has_webhook_channels = false;
     let mut channels: Vec<(String, Box<dyn ironclaw::channels::Channel>)> = Vec::new();
     let mut channel_names: Vec<String> = Vec::new();
 
@@ -812,6 +905,7 @@ async fn setup_wasm_channels(
         tracing::info!("Loaded WASM channel: {}", channel_name);
 
         let secret_name = loaded.webhook_secret_name();
+        let sig_key_secret_name = loaded.signature_key_secret_name();
 
         let webhook_secret = if let Some(secrets) = secrets_store {
             secrets
@@ -885,7 +979,24 @@ async fn setup_wasm_channels(
                 secret_header,
             )
             .await;
-        has_webhook_channels = true;
+
+        // Register Ed25519 signature key if declared in capabilities
+        if let Some(ref sig_key_name) = sig_key_secret_name
+            && let Some(secrets) = secrets_store
+            && let Ok(key_secret) = secrets.get_decrypted("default", sig_key_name).await
+        {
+            match wasm_router
+                .register_signature_key(&channel_name, key_secret.expose())
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(channel = %channel_name, "Registered Ed25519 signature key")
+                }
+                Err(e) => {
+                    tracing::error!(channel = %channel_name, error = %e, "Invalid signature key in secrets store")
+                }
+            }
+        }
 
         if let Some(secrets) = secrets_store {
             match inject_channel_credentials(&channel_arc, secrets.as_ref(), &channel_name).await {
@@ -915,13 +1026,13 @@ async fn setup_wasm_channels(
         tracing::warn!("Failed to load WASM channel {}: {}", path.display(), err);
     }
 
-    let webhook_routes = if has_webhook_channels {
+    // Always create webhook routes (even with no channels loaded) so that
+    // channels hot-added at runtime can receive webhooks without a restart.
+    let webhook_routes = {
         Some(create_wasm_channel_router(
             Arc::clone(&wasm_router),
             extension_manager.map(Arc::clone),
         ))
-    } else {
-        None
     };
 
     Some(WasmChannelSetup {

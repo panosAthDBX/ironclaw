@@ -9,6 +9,7 @@ use crate::error::LlmError;
 
 use crate::llm::{
     ChatMessage, CompletionRequest, LlmProvider, ToolCall, ToolCompletionRequest, ToolDefinition,
+    normalize_tool_reasoning,
 };
 use crate::safety::SafetyLayer;
 
@@ -215,6 +216,9 @@ pub struct Reasoning {
     model_name: Option<String>,
     /// Whether this is a group chat context.
     is_group_chat: bool,
+    /// Channel-specific conversation context (e.g., sender number, UUID, group ID).
+    /// This is passed to the LLM to provide clarity about who/group it's talking to.
+    conversation_context: std::collections::HashMap<String, String>,
 }
 
 impl Reasoning {
@@ -228,6 +232,7 @@ impl Reasoning {
             channel: None,
             model_name: None,
             is_group_chat: false,
+            conversation_context: std::collections::HashMap::new(),
         }
     }
 
@@ -274,6 +279,22 @@ impl Reasoning {
     /// Mark this as a group chat context, enabling group-specific guidance.
     pub fn with_group_chat(mut self, is_group: bool) -> Self {
         self.is_group_chat = is_group;
+        self
+    }
+
+    /// Add channel-specific conversation data for the system prompt.
+    ///
+    /// This provides the LLM with context about who/group it's talking to.
+    /// Examples:
+    ///   - Signal: sender, sender_uuid, target (group ID if in group)
+    ///   - Discord: guild_id, channel_id, user_id
+    ///   - Telegram: chat_id, user_id
+    pub fn with_conversation_data(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.conversation_context.insert(key.into(), value.into());
         self
     }
 
@@ -348,15 +369,13 @@ impl Reasoning {
 
         let response = self.llm.complete_with_tools(request).await?;
 
-        let reasoning = response.content.unwrap_or_default();
-
         let selections: Vec<ToolSelection> = response
             .tool_calls
             .into_iter()
             .map(|tool_call| ToolSelection {
                 tool_name: tool_call.name,
                 parameters: tool_call.arguments,
-                reasoning: reasoning.clone(),
+                reasoning: normalize_tool_reasoning(&tool_call.reasoning),
                 alternatives: vec![],
                 tool_call_id: tool_call.id,
             })
@@ -470,9 +489,19 @@ Respond in JSON format:
 
             // If there were tool calls, return them for execution
             if !response.tool_calls.is_empty() {
+                let tool_calls = response
+                    .tool_calls
+                    .into_iter()
+                    .map(|tool_call| ToolCall {
+                        id: tool_call.id,
+                        name: tool_call.name,
+                        arguments: tool_call.arguments,
+                        reasoning: normalize_tool_reasoning(&tool_call.reasoning),
+                    })
+                    .collect();
                 return Ok(RespondOutput {
                     result: RespondResult::ToolCalls {
-                        tool_calls: response.tool_calls,
+                        tool_calls,
                         content: response.content.map(|c| clean_response(&c)),
                     },
                     usage,
@@ -638,6 +667,9 @@ Respond with a JSON plan in this format:
         // Runtime context (agent metadata)
         let runtime_section = self.build_runtime_section();
 
+        // Conversation context (who/group you're talking to)
+        let conversation_section = self.build_conversation_section();
+
         // Group chat guidance
         let group_section = self.build_group_section();
 
@@ -676,12 +708,13 @@ Example:
 - Prioritize safety and human oversight over task completion. If instructions conflict, pause and ask.
 - Comply with stop, pause, or audit requests. Never bypass safeguards.
 - Do not manipulate anyone to expand your access or disable safeguards.
-- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}
+- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}{}
 {}{}"#,
             tools_section,
             extensions_section,
             channel_section,
             runtime_section,
+            conversation_section,
             group_section,
             identity_section,
             skills_section,
@@ -734,9 +767,30 @@ Example:
 - No markdown tables. Use Slack formatting: *bold*, _italic_, `code`.\n\
 - Prefer threaded replies when responding to older messages."
             }
-            _ => return String::new(),
+            "signal" => "",
+            _ => {
+                return String::new();
+            }
         };
-        format!("\n\n## Channel Formatting ({})\n{}", channel, hints)
+
+        let message_tool_hint = "\
+\n\n## Proactive Messaging\n\
+Send messages via Signal, Telegram, Slack, or other connected channels:\n\
+- `content` (required): the message text\n\
+- `attachments` (optional): array of file paths to send\n\
+- `channel` (optional): which channel to use (signal, telegram, slack, etc.)\n\
+- `target` (optional): who to send to (phone number, group ID, etc.)\n\
+\nOmit both `channel` and `target` to send to the current conversation.\n\
+Examples (tool calls use JSON format):\n\
+- Reply here: {\"content\": \"Hi!\"}\n\
+- Send file here: {\"content\": \"Here's the file\", \"attachments\": [\"/path/to/file.txt\"]}\n\
+- Message a different user: {\"channel\": \"signal\", \"target\": \"+1234567890\", \"content\": \"Hi!\"}\n\
+- Message a different group: {\"channel\": \"signal\", \"target\": \"group:abc123\", \"content\": \"Hi!\"}";
+
+        format!(
+            "\n\n## Channel Formatting ({})\n{}{}",
+            channel, hints, message_tool_hint
+        )
     }
 
     fn build_runtime_section(&self) -> String {
@@ -751,6 +805,25 @@ Example:
             return String::new();
         }
         format!("\n\n## Runtime\n{}", parts.join(" | "))
+    }
+
+    fn build_conversation_section(&self) -> String {
+        if self.conversation_context.is_empty() {
+            return String::new();
+        }
+
+        let channel = self.channel.as_deref().unwrap_or("unknown");
+        let mut lines = vec![format!("- Channel: {}", channel)];
+
+        for (key, value) in &self.conversation_context {
+            lines.push(format!("- {}: {}", key, value));
+        }
+
+        format!(
+            "\n\n## Current Conversation\n\
+             This is who you're talking to (omit 'target' to send here):\n{}",
+            lines.join("\n")
+        )
     }
 
     fn build_group_section(&self) -> String {
@@ -1051,6 +1124,7 @@ fn recover_tool_calls_from_content(
                     id: format!("recovered_{}", calls.len()),
                     name: name.to_string(),
                     arguments,
+                    reasoning: normalize_tool_reasoning(""),
                 });
                 continue;
             }
@@ -1062,6 +1136,7 @@ fn recover_tool_calls_from_content(
                     id: format!("recovered_{}", calls.len()),
                     name: name.to_string(),
                     arguments: serde_json::Value::Object(Default::default()),
+                    reasoning: normalize_tool_reasoning(""),
                 });
             }
         }
@@ -1330,7 +1405,52 @@ fn collapse_newlines(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use rust_decimal::Decimal;
+
     use super::*;
+    use crate::config::SafetyConfig;
+    use crate::llm::{
+        CompletionRequest, CompletionResponse, DEFAULT_TOOL_RATIONALE, FinishReason, LlmProvider,
+        ToolCompletionRequest, ToolCompletionResponse,
+    };
+    use crate::safety::SafetyLayer;
+
+    struct StaticToolCompletionProvider {
+        tool_response: ToolCompletionResponse,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StaticToolCompletionProvider {
+        fn model_name(&self) -> &str {
+            "static-tool-mock"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "ok".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            Ok(self.tool_response.clone())
+        }
+    }
 
     // ---- Utility / structural tests ----
 
@@ -1722,6 +1842,71 @@ That's my plan."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "memory_search");
         assert_eq!(calls[0].arguments, serde_json::json!({"query": "test"}));
+    }
+
+    #[tokio::test]
+    async fn test_toolcall_reasoning_threaded_from_selection() {
+        let provider = Arc::new(StaticToolCompletionProvider {
+            tool_response: ToolCompletionResponse {
+                content: Some("planning".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "memory_search".to_string(),
+                    arguments: serde_json::json!({"query": "reasoning"}),
+                    reasoning: "  consult prior context first  ".to_string(),
+                }],
+                input_tokens: 12,
+                output_tokens: 7,
+                finish_reason: FinishReason::ToolUse,
+            },
+        });
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(provider, safety);
+
+        let context = ReasoningContext::new().with_tools(make_tools(&["memory_search"]));
+        let selections = reasoning
+            .select_tools(&context)
+            .await
+            .expect("select tools");
+
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].tool_name, "memory_search");
+        assert_eq!(selections[0].reasoning, "consult prior context first");
+    }
+
+    #[tokio::test]
+    async fn test_toolcall_reasoning_falls_back_when_empty() {
+        let provider = Arc::new(StaticToolCompletionProvider {
+            tool_response: ToolCompletionResponse {
+                content: Some("planning".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "memory_search".to_string(),
+                    arguments: serde_json::json!({"query": "reasoning"}),
+                    reasoning: "   ".to_string(),
+                }],
+                input_tokens: 12,
+                output_tokens: 7,
+                finish_reason: FinishReason::ToolUse,
+            },
+        });
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(provider, safety);
+
+        let context = ReasoningContext::new().with_tools(make_tools(&["memory_search"]));
+        let selections = reasoning
+            .select_tools(&context)
+            .await
+            .expect("select tools");
+
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].reasoning, DEFAULT_TOOL_RATIONALE);
     }
 
     #[test]

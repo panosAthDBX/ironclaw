@@ -15,11 +15,13 @@
 //! ```
 
 pub mod auth;
+pub(crate) mod handlers;
 pub mod log_layer;
 pub mod openai_compat;
 pub mod server;
 pub mod sse;
 pub mod types;
+pub(crate) mod util;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -30,7 +32,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::SessionManager;
-use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
+use crate::channels::{
+    Channel, IncomingMessage, MessageStream, OutgoingResponse, ReasoningDecisionUpdate,
+    StatusUpdate,
+};
 use crate::config::GatewayConfig;
 use crate::db::Database;
 use crate::error::ChannelError;
@@ -92,6 +97,7 @@ impl GatewayChannel {
             registry_entries: Vec::new(),
             cost_guard: None,
             startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
         });
 
         Self {
@@ -125,6 +131,7 @@ impl GatewayChannel {
             registry_entries: self.state.registry_entries.clone(),
             cost_guard: self.state.cost_guard.clone(),
             startup_time: self.state.startup_time,
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -306,6 +313,30 @@ impl Channel for GatewayChannel {
             StatusUpdate::StreamChunk(content) => SseEvent::StreamChunk {
                 content,
                 thread_id: thread_id.clone(),
+            },
+            StatusUpdate::ReasoningUpdate {
+                session_id,
+                thread_id,
+                turn_number,
+                narrative,
+                tool_decisions,
+            } => SseEvent::ReasoningUpdate {
+                session_id,
+                thread_id,
+                turn_number,
+                narrative,
+                tool_decisions: tool_decisions
+                    .into_iter()
+                    .map(|decision: ReasoningDecisionUpdate| {
+                        crate::channels::web::types::ToolDecisionSsePayload {
+                            tool_call_id: decision.tool_call_id,
+                            tool_name: decision.tool_name,
+                            rationale: decision.rationale,
+                            outcome: decision.outcome,
+                            parallel_group: decision.parallel_group,
+                        }
+                    })
+                    .collect(),
             },
             StatusUpdate::Status(msg) => SseEvent::Status {
                 message: msg,

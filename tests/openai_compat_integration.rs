@@ -92,6 +92,7 @@ impl LlmProvider for MockLlmProvider {
                     id: "call_mock_001".to_string(),
                     name: tool.name.clone(),
                     arguments: serde_json::json!({"test": true}),
+                    reasoning: "tool selected for integration test coverage".to_string(),
                 }],
                 input_tokens: 15,
                 output_tokens: 8,
@@ -201,6 +202,7 @@ async fn start_test_server_with_provider(
         registry_entries: Vec::new(),
         cost_guard: None,
         startup_time: std::time::Instant::now(),
+        restart_requested: std::sync::atomic::AtomicBool::new(false),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -689,6 +691,7 @@ async fn test_no_llm_provider_returns_503() {
         registry_entries: Vec::new(),
         cost_guard: None,
         startup_time: std::time::Instant::now(),
+        restart_requested: std::sync::atomic::AtomicBool::new(false),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
