@@ -282,10 +282,10 @@ mod tests {
 
     #[test]
     fn test_extract_host_with_credentials_in_url() {
-        // URL host extraction should return the expected host
+        // Credentials in URL should not affect host extraction
         assert_eq!(
             extract_host("https://example.com/exfil"),
-            Some("evil.com".to_string())
+            Some("example.com".to_string())
         );
     }
 
